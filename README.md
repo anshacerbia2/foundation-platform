@@ -92,13 +92,45 @@ requires a SAD for deployed systems. Its designs name both consuming systems in
 | `TDD-foundation-platform-001` | Transactional outbox, dispatcher, and enterprise event envelope | approved |
 | `TDD-foundation-platform-002` | HTTP substrate, persistence, and telemetry | approved |
 
-## Building locally
+## Prerequisites
 
-Go alone needs no C compiler. The race detector does, because it is implemented in C
-and reached through cgo, and it must target the same architecture as the Go toolchain.
+| | Required for | Notes |
+| :-- | :-- | :-- |
+| Go 1.26 | everything | `go.mod` declares 1.25 as the language floor; CI builds on 1.26 |
+| A C compiler matching `GOARCH` | `go test -race` only | The race detector is implemented in C and reached through cgo |
+| `govulncheck` | the vulnerability scan | `go install golang.org/x/vuln/cmd/govulncheck@latest` |
+
+Nothing else. No database is needed to run the test suite, and no container runtime —
+`db` is tested against a fake connection source rather than a live PostgreSQL.
+
+The C compiler is the only prerequisite that catches people out, because a compiler
+being present is not the same as it being usable. It must emit binaries for the same
+architecture as the Go toolchain.
 
 ```sh
-gofmt -l .            # must print nothing
+go env GOARCH      # amd64
+gcc -dumpmachine   # must agree, e.g. x86_64-w64-mingw32
+```
+
+`x86_64` or `aarch64` in the compiler triple must line up with `amd64` or `arm64` in
+`GOARCH`. A mismatch fails at link time with `64-bit mode not compiled in` or a similar
+message, which reads like a broken build rather than a missing prerequisite.
+
+On Windows, MinGW.org is a dead project and its last GCC is 32-bit only. Use MinGW-w64:
+extract a [WinLibs](https://winlibs.com) archive and put its `bin` ahead of any older
+toolchain on `PATH`. On Linux and macOS the system compiler already matches.
+
+Environment-specific findings for this workstation — proxy behaviour, install paths —
+are recorded in [ROADMAP.md](ROADMAP.md) rather than here, because they describe a
+machine rather than the repository.
+
+## Verifying a change
+
+These are the same checks CI runs, in the same order. `.github/workflows/ci.yml` is
+authoritative; this list exists so a failure is found before a push, not after.
+
+```sh
+gofmt -l .                                      # must print nothing
 go vet ./...
 go build ./...
 go test ./... -race -count=1
@@ -108,7 +140,47 @@ govulncheck ./...
 ```
 
 `go test` with no argument tests only the current directory, and the module root holds
-no Go files. `./...` is what CI runs and what a local check should match.
+no Go files — hence `no Go files in ...`. Always pass `./...`.
+
+`-count=1` disables the test result cache. Without it a passing run may be a replay of
+an earlier one, which is the wrong thing to trust when the point is to check the code
+in front of you.
+
+## Testing conventions
+
+**Every check must be able to fail.** A gate that has never rejected anything is
+indistinguishable from no gate, so each one here has been made to fire deliberately at
+least once:
+
+- `tools/archcheck` has a fixture per rule that violates it, and the test asserts the
+  rule rejects it. See `tools/archcheck/testdata/`.
+- The race detector was verified armed by compiling a deliberate unsynchronised write
+  and confirming it was reported.
+
+**Tests do not require infrastructure.** `db` exercises transaction semantics against a
+fake whose `pgx.Tx` is embedded but not implemented, so any call beyond commit and
+rollback panics on a nil interface. That is a structural assertion, not a mock: it
+proves `InTx` touches nothing else, and it keeps failing if that stops being true.
+
+`db.Open`, `db.Ping`, and `db.Close` are consequently uncovered. They need a running
+PostgreSQL and belong to integration tests, not to this suite.
+
+**Coverage floor is 80%**, measured over shipped packages only:
+
+```sh
+go test $(go list ./... | grep -v '/tools/') -covermode=atomic -coverprofile=coverage.out
+go tool cover -func=coverage.out
+```
+
+`tools/` is excluded because it is verified by its own tests rather than by a
+percentage, and a large build tool would otherwise move a number that is meant to
+describe the library. The floor is a floor, not a target — coverage that rises by
+testing getters buys nothing.
+
+**Architecture rules are asserted against the package graph**, not against text.
+`tools/archcheck` reads `go list -json`, so an import introduced through an alias, a
+blank identifier, or a test file is caught on the same basis as a direct one. The rules
+it enforces are declared in `arch.json` and derive from STD-GLB-BE-001.
 
 ## Versioning
 

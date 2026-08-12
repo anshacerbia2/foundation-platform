@@ -12,7 +12,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `id` | **done** | UUIDv7 per RFC 9562, monotonic counter in `rand_a`; 96.8% coverage |
 | `event` | **done** | CloudEvents 1.0 envelope and validated type; 90.8% coverage |
 | `tools/archcheck` | **done** | 16 tests over fixtures, including that each rule rejects a known violation |
-| `.github/workflows/ci.yml` | **done** | gofmt, vet, build, race, coverage floor, archcheck, tidy, govulncheck |
+| `.github/workflows/ci.yml` | **done** | Green on `ci #3`; every gate has now executed at least once, including the two that had never run |
 | `db` | **done** | `InTx` semantics unit-tested with no database; 75.7% coverage |
 | `outbox` | next | `db.Tx` now exists, so `Append` can require the handle |
 | `inbox` | not started | — |
@@ -34,6 +34,17 @@ would let it depress a figure meant to describe the library.
 PostgreSQL and are covered by integration tests once Docker exists, which is why `db`
 sits lower than the other two rather than because its logic is untested — the
 transaction semantics that matter are exercised against a fake connection source.
+
+The first CI run rejected the push: `govulncheck` traced GO-2026-5970 from `db.Open`
+through `pgxpool.NewWithConfig` into `norm.Form.Properties`, an infinite loop on invalid
+input in `golang.org/x/text`. pgx normalises credentials with SASLprep during SCRAM
+authentication, so the path was live rather than merely present in the module graph.
+Raised to v0.39.0.
+
+Worth recording because the finding required no commit on our part and the same is true
+of the next one. A scheduled run would move that discovery off the critical path of
+whatever is being pushed at the time; the workflow is currently triggered by push and
+pull request only.
 
 ## Environment findings
 
