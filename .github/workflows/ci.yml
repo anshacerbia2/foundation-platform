@@ -48,9 +48,10 @@ jobs:
       # dispatcher, whose workers share state by design, so this step is the gate that
       # makes its concurrency claims verifiable.
       #
-      # It cannot run on a Windows workstation with a 32-bit MinGW toolchain, because
-      # the detector requires cgo and a matching C compiler. That is a workstation
-      # limitation; here it runs unconditionally.
+      # The detector needs cgo and a C compiler matching GOARCH, which is a workstation
+      # setup problem rather than a property of the code. Here it runs unconditionally,
+      # so a contributor without that toolchain still cannot merge an unsynchronised
+      # write.
       - name: test with race detector
         run: go test ./... -race -count=1
 

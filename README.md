@@ -90,6 +90,25 @@ requires a SAD for deployed systems. Its designs name both consuming systems in
 | TDD | Subject | Status |
 | :-- | :-- | :-- |
 | `TDD-foundation-platform-001` | Transactional outbox, dispatcher, and enterprise event envelope | approved |
+| `TDD-foundation-platform-002` | HTTP substrate, persistence, and telemetry | approved |
+
+## Building locally
+
+Go alone needs no C compiler. The race detector does, because it is implemented in C
+and reached through cgo, and it must target the same architecture as the Go toolchain.
+
+```sh
+gofmt -l .            # must print nothing
+go vet ./...
+go build ./...
+go test ./... -race -count=1
+go run ./tools/archcheck
+go mod tidy && git diff --exit-code go.mod go.sum
+govulncheck ./...
+```
+
+`go test` with no argument tests only the current directory, and the module root holds
+no Go files. `./...` is what CI runs and what a local check should match.
 
 ## Versioning
 

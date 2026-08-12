@@ -44,13 +44,23 @@ the same wall should not have to rediscover it.
 | :-- | :-- |
 | `proxy.golang.org` fails TLS verification on this network; `sum.golang.org` and `github.com` do not | Build with `GOPROXY=direct`, which fetches from VCS and still verifies checksums against the working sum database |
 | Go 1.26.5 installed at `D:\Go1.26.5`; `D:\Go\bin` remains first on the machine PATH and resolves to 1.24.2 | Prepend `D:\Go1.26.5\bin` per session, or replace the machine PATH entry with an elevated shell |
-| The local C toolchain is 32-bit MinGW; the race detector requires cgo with a matching compiler | `go test -race` cannot run on this workstation. It runs unconditionally in CI, which is where the gate belongs |
+| `winget` is disabled by Group Policy | Toolchains are installed by extracting an archive, not by a package manager |
+| The C toolchain at `C:\MinGW` is MinGW.org GCC 6.3.0, which cannot emit 64-bit code | Resolved. MinGW-w64 GCC 16.2.0 extracted to `D:\mingw64`; prepend `D:\mingw64\bin` to PATH ahead of `C:\MinGW\bin` |
 | Atlas and Docker are absent | Migrations can be authored but not applied; integration tests are CI-only until both exist |
 
-The third is the one that matters. Until the first CI run, the concurrency in `id` is
-supported by a uniqueness test over 8,000 identifiers from 16 goroutines — which proves
-the output is correct and does not prove the absence of a data race. Only the detector
-proves that, and `outbox` is where it will matter most.
+The race detector now runs locally. It required a matching C compiler, because the
+detector is implemented in C and reached through cgo, and the toolchain that shipped
+with this workstation was a 32-bit build from 2016 against a `windows/amd64` Go.
+
+That the suite passes under `-race` was verified to mean something: a deliberate
+unsynchronised increment across eight goroutines was compiled in a throwaway module and
+reported, with the conflicting addresses and the line that wrote them. A detector that
+reports nothing because it is not armed is indistinguishable from correct code, and the
+only way to tell them apart is to make it fire.
+
+`go test ./... -race` remains a CI gate regardless. Local availability shortens the loop
+while `outbox` is written — its dispatcher workers share lease state by design — but the
+gate that decides whether a change lands is the one in CI.
 
 ## Position in the build order
 
