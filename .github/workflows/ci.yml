@@ -1,0 +1,107 @@
+name: ci
+
+# Every check here corresponds to a rule in STD-GLB-BE-001. A rule without a check in
+# this file is a suggestion, and the standard is explicit that a boundary a machine
+# cannot read is a boundary that erodes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      # STD-GLB-BE-001 does not mandate a formatter, but an unformatted diff hides the
+      # change that matters inside noise, which makes review less effective.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # The race detector is the only thing that distinguishes correct synchronisation
+      # from synchronisation that has been lucky. This repository owns the outbox
+      # dispatcher, whose workers share state by design, so this step is the gate that
+      # makes its concurrency claims verifiable.
+      #
+      # It cannot run on a Windows workstation with a 32-bit MinGW toolchain, because
+      # the detector requires cgo and a matching C compiler. That is a workstation
+      # limitation; here it runs unconditionally.
+      - name: test with race detector
+        run: go test ./... -race -count=1
+
+      # Coverage is measured over shipped packages only. Build tooling under tools/ is
+      # verified by its own tests rather than by a percentage, and including it would
+      # let a large tool depress a figure that is meant to describe the library.
+      - name: coverage floor
+        run: |
+          pkgs=$(go list ./... | grep -v '/tools/' | paste -sd ' ')
+          go test $pkgs -count=1 -covermode=atomic -coverprofile=coverage.out
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
+          echo "shipped-package coverage: ${total}%"
+          if awk "BEGIN {exit !($total < 80)}"; then
+            echo "::error::coverage ${total}% is below the 80% floor"
+            exit 1
+          fi
+
+      # STD-GLB-BE-001 rules 3, 4, 7, and 12, asserted against the package graph rather
+      # than against text, so an import introduced through an alias, a blank identifier,
+      # or a test file is detected on the same basis as a direct one.
+      - name: architecture boundaries
+        run: go run ./tools/archcheck
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # A dependency present in go.mod but absent from the build is debt that arrives
+      # with a vulnerability report attached.
+      - name: dependencies are tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go mod tidy changed go.mod or go.sum; commit the result"
+            exit 1
+          fi
+
+      - name: vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

@@ -1,0 +1,16 @@
+# Coverage profiles are build output. CI produces and uploads them as an artifact, so
+# a committed copy is only ever stale.
+*.out
+coverage
+cov-src
+
+# Binaries produced by `go build` without -o.
+/foundation-platform
+/archcheck
+
+# Editor and OS noise.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

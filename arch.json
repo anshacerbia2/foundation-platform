@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Boundaries asserted by tools/archcheck on every build, per STD-GLB-BE-001.",
+    "",
+    "This repository is a shared library, so it carries no domain/app/adapter layers.",
+    "What it does carry is a dependency graph that must stay acyclic and intentional:",
+    "an edge added by accident is coupling two consuming systems will inherit.",
+    "",
+    "A package absent from internalEdges may import no internal package.",
+    "An edge not declared here fails the build."
+  ],
+
+  "module": "github.com/anshacerbia2/foundation-platform",
+
+  "internalEdges": {
+    "id": [],
+    "event": ["id"],
+    "inbox": ["id", "db"],
+    "idempotency": ["id", "db"],
+    "outbox": ["id", "event", "db"],
+    "db": [],
+    "httpapi": ["id", "observability"],
+    "observability": ["id"]
+  },
+
+  "pureSegments": ["domain"],
+
+  "noGoroutineSegments": ["domain", "app"],
+
+  "deniedImports": {
+    "github.com/jackc/pgx": {
+      "reason": "only db/ names the driver; every other package takes db.Tx, so the driver is named in one place rather than in every service signature",
+      "except": ["db"]
+    }
+  },
+
+  "reservedDirNames": [
+    "interface",
+    "type",
+    "func",
+    "range",
+    "map",
+    "select",
+    "go",
+    "chan",
+    "package",
+    "import",
+    "const",
+    "var",
+    "return",
+    "struct"
+  ]
+}
