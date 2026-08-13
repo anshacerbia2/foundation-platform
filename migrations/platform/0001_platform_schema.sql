@@ -39,6 +39,25 @@ CREATE TABLE IF NOT EXISTS platform.outbox (
     published_at TIMESTAMPTZ,
     attempts     INTEGER     NOT NULL DEFAULT 0,
     last_error   TEXT,
+
+    -- The branch the dispatcher took, named by the design's dispatch algorithm alongside
+    -- last_error. Kept on the row rather than derived from the message, because the
+    -- classification decides whether the row is retried or abandoned and an operator
+    -- reading a stuck row needs to see which was chosen.
+    failure_class TEXT,
+
+    -- When this row first failed to publish. platform.dead_letter requires it NOT NULL,
+    -- and by the time a row is dead-lettered the first failure is several attempts in the
+    -- past, so it cannot be reconstructed at that moment.
+    first_failed_at TIMESTAMPTZ,
+
+    -- The earliest a failed row may be claimed again.
+    --
+    -- Backoff is mandated by STD-GLB-004 and cannot be expressed without it: a worker
+    -- that slept instead would hold the row's lock while sleeping, which converts a
+    -- delay for one event into a stall for the batch.
+    next_attempt_at TIMESTAMPTZ,
+
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (created_at, event_id)
 ) PARTITION BY RANGE (created_at);

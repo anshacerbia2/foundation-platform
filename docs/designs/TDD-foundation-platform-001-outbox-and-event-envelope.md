@@ -148,6 +148,9 @@ CREATE TABLE platform.outbox (
     published_at TIMESTAMPTZ,
     attempts     INTEGER     NOT NULL DEFAULT 0,
     last_error   TEXT,
+    failure_class   TEXT,
+    first_failed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (created_at, event_id)
 ) PARTITION BY RANGE (created_at);
@@ -160,6 +163,23 @@ CREATE INDEX outbox_unpublished
 deduplicate on. `published` is the mandated boolean and carries the partial index;
 `published_at` records when, for latency measurement, and is never used as the
 predicate.
+
+Three columns were added during implementation because the dispatch algorithm below
+cannot be expressed without them, and each is named by that algorithm or by a table it
+writes to.
+
+`next_attempt_at` is the earliest a failed row may be claimed again. STD-GLB-004 mandates
+exponential backoff, and without this column the only way to express a delay is for the
+worker to sleep — which would hold the claimed row's lock for the duration and turn a
+delay for one event into a stall for its whole batch.
+
+`first_failed_at` records when a row first failed to publish. `platform.dead_letter`
+requires it `NOT NULL`, and by the time a row is dead-lettered its first failure is
+several attempts in the past and cannot be reconstructed.
+
+`failure_class` is the branch the dispatcher took, which the algorithm names alongside
+`last_error`. It decides whether a row is retried or abandoned, so an operator reading a
+stuck row needs to see which was chosen rather than infer it from a message.
 
 `sequence` comes from a database sequence rather than an identity column so that it
 stays monotonic across partitions. It supplies dispatch ordering and the snapshot
@@ -462,6 +482,27 @@ It is genuinely unbounded, it is a containment failure, and §Operational Notes 
 it at any occurrence with no threshold.
 
 Replicas contend safely because `SKIP LOCKED` lets each claim a disjoint batch.
+
+**Departure recorded: a released priority row does not reset its attempt count.** The
+pseudocode above says `reset attempts, release to the unpublished pool, escalate the claim
+backoff`. The first and third clauses contradict each other — a counter that resets cannot
+escalate, and the backoff is derived from it.
+
+The implementation keeps the count. Nothing is lost, because what protects a priority row
+from being abandoned is the classification rule and not the size of the number: the
+decision function returns *release* for a priority row at any attempt count, so it can
+never reach dead-letter through unavailability. Keeping the count lets the delay grow
+toward `OUTBOX_PRIORITY_CLAIM_BACKOFF_MAX` instead of oscillating, and leaves an operator
+able to see what an outage has cost. A test asserts the row survives several hundred
+consecutive failures without being dead-lettered.
+
+**Claim, publish, and settle share one transaction**, so the row lock *is* the lease.
+Another worker cannot take a row that is mid-publication, and a crashed dispatcher
+releases its rows immediately rather than leaving them claimed until a lease expires. The
+cost is that broker latency is spent holding locks, which `SKIP LOCKED` makes survivable:
+a second worker steps over the locked rows rather than queueing behind them. If publish
+latency ever approaches the claim budget, the alternative is a lease column and settlement
+in a second transaction, which trades the recovery property away for shorter locks.
 
 ### Consumption
 

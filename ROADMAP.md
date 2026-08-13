@@ -16,7 +16,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `db` | **done** | `InTx` semantics unit-tested with no database; 75.7% coverage |
 | `db/dbtest` | **done** | Records statements instead of running them, so packages above `db` test without a database and without naming the driver; 100% coverage |
 | `migrations` | **done** | Full `platform` schema, embedded and shipped through `go.mod`; applied and asserted by the integration suite |
-| `outbox` | **partial** | `Append` done and verified against PostgreSQL. Dispatcher, lease, retry, and dead-letter routing remain |
+| `outbox` | **done** | `Append` and the dispatcher: claim with `SKIP LOCKED`, two lanes, poison and unavailable classification, backoff, dead-letter routing |
 | `inbox` | not started | — |
 | `idempotency` | not started | — |
 | `httpapi` | not started | No database dependency; can proceed in parallel with `db` |
@@ -27,9 +27,14 @@ Week numbers are relative to the first build week, not calendar dates.
 accidental coupling introduced while writing them fails the build rather than
 accumulating.
 
-Shipped-package coverage is **88.1%** against an 80% floor. Coverage excludes `tools/`,
-which is verified by its own tests rather than by a percentage; including a large tool
-would let it depress a figure meant to describe the library.
+Coverage is measured against an 80% floor, excludes `tools/`, and **is only meaningful in
+CI**. A local run without a database reports around 71%, because the dispatcher's entire
+suite is integration tests that skip themselves. The number to read is the one CI prints,
+where they run.
+
+That is a property of the code rather than a gap in it: claim ordering, `SKIP LOCKED`
+disjointness, backoff scheduling, and dead-letter routing are all statements about what
+PostgreSQL does, and a fake asserting them would only be asserting itself.
 
 **The two previously unverified claims now have a gate.** CI runs a `postgres:17-alpine`
 service container, applies the shipped schema, and asserts what only a database can

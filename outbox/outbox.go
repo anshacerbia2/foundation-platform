@@ -47,13 +47,15 @@ var (
 	ErrNoAggregate = errors.New("outbox: an aggregate identifier is required")
 )
 
-// config is the resolved set of options for one append.
-type config struct {
+// appendOptions is the resolved set of options for one append. Named apart from Config,
+// which configures the dispatcher: one describes a single write, the other a long-running
+// process, and a reader should not have to check which.
+type appendOptions struct {
 	priority int16
 }
 
 // Option adjusts how an event is appended.
-type Option func(*config)
+type Option func(*appendOptions)
 
 // Priority routes the event to the reserved dispatch lane.
 //
@@ -62,7 +64,7 @@ type Option func(*config)
 // with escalating claim backoff, because abandoning a revocation that would have
 // published a minute later is not a failure mode the publisher can compensate for.
 func Priority() Option {
-	return func(c *config) { c.priority = PriorityHigh }
+	return func(o *appendOptions) { o.priority = PriorityHigh }
 }
 
 // appendStatement inserts one event.
@@ -104,9 +106,9 @@ func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope
 		return fmt.Errorf("outbox: %w", err)
 	}
 
-	cfg := config{priority: PriorityStandard}
+	resolved := appendOptions{priority: PriorityStandard}
 	for _, opt := range opts {
-		opt(&cfg)
+		opt(&resolved)
 	}
 
 	envelope, err := json.Marshal(e)
@@ -125,7 +127,7 @@ func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope
 		e.ID.String(),
 		string(e.Type),
 		aggregateID.String(),
-		cfg.priority,
+		resolved.priority,
 		[]byte(e.Data),
 		envelope,
 	); err != nil {

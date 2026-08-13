@@ -26,7 +26,10 @@ jobs:
     # that survive every test written against a double.
     services:
       postgres:
-        image: postgres:17-alpine
+        # Pinned by digest, not by tag. A tag moves, so an unpinned run six months from
+        # now would test against a different server with no commit to show for it, and
+        # the day it breaks the change is invisible in the history.
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
         env:
           POSTGRES_USER: platform
           POSTGRES_PASSWORD: platform
