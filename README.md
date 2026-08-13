@@ -24,12 +24,14 @@ it is worth more than the coupling one shared dependency introduces.
 | Package | Contents |
 | :-- | :-- |
 | `id` | UUIDv7 generation, parsing, and ordering — the canonical identifier form under STD-GLB-002 |
-| `outbox` | Outbox table access, dispatcher, lease management, retry and dead-letter routing |
+| `outbox` | Outbox append, dispatcher, claim and retry policy, dead-letter routing |
+| `migrations` | The `platform` schema, embedded so consumers receive it through `go.mod` |
 | `event` | CloudEvents 1.0 envelope construction, type naming, schema version binding |
 | `inbox` | Deduplication guard over `platform.processed_event` |
 | `idempotency` | Idempotency key claim, conflict detection, stored-response replay |
 | `httpapi` | Routing, middleware, RFC 7807 problem serialization |
 | `db` | Pool construction and the transaction manager that binds outbox writes to domain writes |
+| `db/dbtest` | A `db.Tx` that records statements, so packages forbidden from naming the driver can still be tested |
 | `observability` | Tracing, metrics, structured logging, correlation propagation |
 | `contracts/events` | Versioned event schemas exchanged between the two systems |
 
@@ -121,6 +123,51 @@ system's migration job, not to a library linked into its application.
 | :-- | :-- | :-- |
 | `TDD-foundation-platform-001` | Transactional outbox, dispatcher, and enterprise event envelope | approved |
 | `TDD-foundation-platform-002` | HTTP substrate, persistence, and telemetry | approved |
+
+## Publishing an event
+
+There is one publication path, and it takes a transaction handle it does not open. A
+service that mutates state and publishes in two transactions does not compile.
+
+```go
+err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+    if err := memberships.Save(ctx, tx, m); err != nil {   // the domain mutation
+        return err
+    }
+
+    envelope, err := event.New(source, typ, m.RevokedAt(), payload)
+    if err != nil {
+        return err
+    }
+
+    return outbox.Append(ctx, tx, m.ID(), envelope, outbox.Priority())
+})
+```
+
+`outbox.Priority()` routes the event to the reserved dispatch lane, which exists so a
+lifecycle backlog cannot delay a revocation. Use it for security state changes and nothing
+else; a lane everything is urgent in reserves nothing.
+
+The dispatcher is constructed by the composition root and driven by `Run`, which blocks
+until its context is cancelled and then waits for every worker. It starts nothing on
+import, because a package that starts a goroutine when it is linked cannot be shut down by
+the process that linked it.
+
+```go
+dispatcher, err := outbox.NewDispatcher(pool, broker, outbox.Config{})
+if err != nil {
+    return err
+}
+go func() { errs <- dispatcher.Run(ctx) }()
+```
+
+`broker` is anything satisfying `outbox.Publisher`. This module holds no broker client: the
+interface is declared here because this package is what needs it, and the adapter that
+satisfies it belongs to the consuming system, whose SAD records which broker it is.
+
+A publisher signals an unfixable failure by wrapping `outbox.ErrPoison`. Everything else is
+treated as a broker that may return, which is deliberate — an unrecognised error is never
+poison, because discarding a revocation costs more than three wasted retries.
 
 ## Prerequisites
 
