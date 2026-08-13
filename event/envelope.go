@@ -59,8 +59,11 @@ func (s Source) String() string { return string(s) }
 // Envelope is a CloudEvents 1.0 event in its enterprise form.
 //
 // The seven fields STD-GLB-004 requires are all present and all mandatory. DataSchema
-// is the one optional member, and it carries the registry location of the payload
-// contract.
+// is optional and carries the registry location of the payload contract.
+// StreamPosition is the publisher-local position assigned by the transactional outbox.
+// It is absent while a domain constructs an event and mandatory once the event is
+// published. Consumers use it with a snapshot high-water mark; it is not a broker
+// offset and gaps are valid because a rolled-back transaction can consume a sequence.
 //
 // Domain-specific fields — aggregate version, correlation, causation — live inside
 // Data, because that is the layer that owns them. Placing them beside the CloudEvents
@@ -73,6 +76,7 @@ type Envelope struct {
 	Time            time.Time
 	DataContentType string
 	DataSchema      string
+	StreamPosition  int64
 	Data            json.RawMessage
 }
 
@@ -122,6 +126,14 @@ func (e Envelope) WithSchema(uri string) Envelope {
 	return e
 }
 
+// WithStreamPosition binds the publisher-local stream position assigned by the outbox.
+// Domain code does not call it; the dispatcher owns the transition from a constructed
+// event to a deliverable event.
+func (e Envelope) WithStreamPosition(position int64) Envelope {
+	e.StreamPosition = position
+	return e
+}
+
 // Validate reports whether the envelope satisfies STD-GLB-004.
 //
 // It runs on construction and again on receipt. An envelope arriving from a broker
@@ -139,6 +151,8 @@ func (e Envelope) Validate() error {
 	}
 	if e.Source == "" {
 		problems = append(problems, "source is absent")
+	} else if _, err := ParseSource(string(e.Source)); err != nil {
+		problems = append(problems, err.Error())
 	}
 	if e.Type == "" {
 		problems = append(problems, "type is absent")
@@ -154,9 +168,25 @@ func (e Envelope) Validate() error {
 	if len(e.Data) == 0 {
 		problems = append(problems, "data is absent")
 	}
+	if e.StreamPosition < 0 {
+		problems = append(problems, "streamposition must not be negative")
+	}
 
 	if len(problems) > 0 {
 		return fmt.Errorf("event: invalid envelope: %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// ValidatePublished reports whether an envelope is safe to cross the broker boundary.
+// Validate deliberately permits position zero because an event does not receive its
+// position until Append. The dispatcher and every consumer validate the published form.
+func (e Envelope) ValidatePublished() error {
+	if err := e.Validate(); err != nil {
+		return err
+	}
+	if e.StreamPosition == 0 {
+		return errors.New("event: invalid published envelope: streamposition is absent")
 	}
 	return nil
 }
@@ -173,6 +203,7 @@ type wire struct {
 	Time            string          `json:"time"`
 	DataContentType string          `json:"datacontenttype"`
 	DataSchema      string          `json:"dataschema,omitempty"`
+	StreamPosition  int64           `json:"streamposition,omitempty"`
 	Data            json.RawMessage `json:"data"`
 }
 
@@ -189,6 +220,7 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 		Time:            e.Time.UTC().Format(time.RFC3339Nano),
 		DataContentType: e.DataContentType,
 		DataSchema:      e.DataSchema,
+		StreamPosition:  e.StreamPosition,
 		Data:            e.Data,
 	})
 }
@@ -213,6 +245,7 @@ func (e *Envelope) UnmarshalJSON(b []byte) error {
 		Time:            occurred.UTC(),
 		DataContentType: w.DataContentType,
 		DataSchema:      w.DataSchema,
+		StreamPosition:  w.StreamPosition,
 		Data:            w.Data,
 	}
 	if err := candidate.Validate(); err != nil {

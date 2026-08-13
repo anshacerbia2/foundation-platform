@@ -22,8 +22,10 @@ CREATE SCHEMA IF NOT EXISTS platform;
 -- ---------------------------------------------------------------------------
 
 -- A sequence rather than an identity column, so the value stays monotonic across
--- partitions. It supplies dispatch ordering and the high-water mark a projection
--- consumer resumes from. It is a stream position and not an entity identifier, which is
+-- partitions. The append statement writes the same value into the CloudEvents
+-- streamposition extension. It supplies dispatch ordering and the high-water mark a
+-- projection consumer compares buffered events against. It is a stream position and not
+-- a broker offset or entity identifier, which is
 -- why the prohibition on exposing sequential identifiers in STD-GLB-002 does not reach it.
 CREATE SEQUENCE IF NOT EXISTS platform.outbox_sequence AS BIGINT;
 

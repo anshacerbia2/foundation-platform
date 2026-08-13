@@ -180,6 +180,7 @@ type claimed struct {
 	createdAt time.Time
 	eventID   string
 	eventType string
+	position  int64
 	priority  int16
 	attempts  int
 	envelope  []byte
@@ -187,7 +188,7 @@ type claimed struct {
 
 // claimStatement takes the reserved lane as a parameter rather than embedding the
 // priority value, so the predicate cannot drift from the Go constant it is meant to match.
-const claimStatement = `SELECT created_at, event_id::text, event_type, priority, attempts, envelope
+const claimStatement = `SELECT created_at, event_id::text, event_type, sequence, priority, attempts, envelope
 FROM platform.outbox
 WHERE published = FALSE
   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
@@ -236,7 +237,7 @@ func (d *Dispatcher) claim(ctx context.Context, tx db.Tx, priorityOnly bool) ([]
 	var batch []claimed
 	for rows.Next() {
 		var c claimed
-		if err := rows.Scan(&c.createdAt, &c.eventID, &c.eventType, &c.priority, &c.attempts, &c.envelope); err != nil {
+		if err := rows.Scan(&c.createdAt, &c.eventID, &c.eventType, &c.position, &c.priority, &c.attempts, &c.envelope); err != nil {
 			return nil, fmt.Errorf("outbox: reading a claimed row: %w", err)
 		}
 		batch = append(batch, c)
@@ -259,6 +260,15 @@ func (d *Dispatcher) settle(ctx context.Context, tx db.Tx, row claimed) error {
 		// It is poison without ever reaching the broker.
 		return d.fail(ctx, tx, row, FailurePoison,
 			fmt.Sprintf("stored envelope is undecodable: %v", err))
+	}
+	if envelope.StreamPosition != 0 && envelope.StreamPosition != row.position {
+		return d.fail(ctx, tx, row, FailurePoison,
+			fmt.Sprintf("stored streamposition %d disagrees with outbox sequence %d", envelope.StreamPosition, row.position))
+	}
+	envelope = envelope.WithStreamPosition(row.position)
+	if err := envelope.ValidatePublished(); err != nil {
+		return d.fail(ctx, tx, row, FailurePoison,
+			fmt.Sprintf("stored envelope is not publishable: %v", err))
 	}
 
 	if err := d.publisher.Publish(ctx, envelope); err != nil {

@@ -69,14 +69,18 @@ func Priority() Option {
 
 // appendStatement inserts one event.
 //
-// The columns this statement omits are as deliberate as the ones it sets. sequence comes
-// from platform.outbox_sequence so it stays monotonic across partitions, created_at from
-// now() so the partition routing agrees with the database's clock rather than the
-// application's, and published, attempts, and last_error from their defaults because the
-// dispatcher owns them.
-const appendStatement = `INSERT INTO platform.outbox
-	(event_id, event_type, aggregate_id, priority, payload, envelope)
-VALUES ($1, $2, $3, $4, $5, $6)`
+// One nextval supplies both the ordering column and the CloudEvents streamposition
+// extension. Keeping the assignment inside this statement makes the row and envelope
+// impossible to disagree. created_at, published, attempts, and last_error retain their
+// database defaults.
+const appendStatement = `WITH positioned AS (
+	SELECT nextval('platform.outbox_sequence')::bigint AS stream_position
+)
+INSERT INTO platform.outbox
+	(event_id, sequence, event_type, aggregate_id, priority, payload, envelope)
+SELECT $1, positioned.stream_position, $2, $3, $4, $5,
+	jsonb_set($6::jsonb, '{streamposition}', to_jsonb(positioned.stream_position), true)
+FROM positioned`
 
 // Append writes an event to the outbox inside the caller's transaction.
 //

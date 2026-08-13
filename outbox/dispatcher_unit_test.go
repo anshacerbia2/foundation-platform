@@ -45,7 +45,7 @@ func TestDispatchOnceClaimsPublishesAndMarksTheRow(t *testing.T) {
 	}
 	var published event.Envelope
 	dispatcher, tx := dispatcherWithRows(t, [][]any{{
-		time.Now(), envelope.ID.String(), string(envelope.Type), PriorityStandard, 0, wire,
+		time.Now(), envelope.ID.String(), string(envelope.Type), int64(42), PriorityStandard, 0, wire,
 	}}, func(_ context.Context, got event.Envelope) error {
 		published = got
 		return nil
@@ -57,6 +57,9 @@ func TestDispatchOnceClaimsPublishesAndMarksTheRow(t *testing.T) {
 	}
 	if count != 1 || published.ID != envelope.ID {
 		t.Errorf("count = %d, published = %s", count, published.ID)
+	}
+	if published.StreamPosition != 42 {
+		t.Errorf("streamposition = %d, want 42", published.StreamPosition)
 	}
 	if len(tx.Calls()) != 2 {
 		t.Fatalf("calls = %d, want claim and mark", len(tx.Calls()))
@@ -71,7 +74,7 @@ func TestDispatchOnceRecordsPublisherFailure(t *testing.T) {
 	}
 	injected := errors.New("connection refused token=visible")
 	dispatcher, tx := dispatcherWithRows(t, [][]any{{
-		time.Now(), envelope.ID.String(), string(envelope.Type), PriorityStandard, 0, wire,
+		time.Now(), envelope.ID.String(), string(envelope.Type), int64(42), PriorityStandard, 0, wire,
 	}}, func(context.Context, event.Envelope) error { return injected })
 
 	if _, err := dispatcher.dispatchOnce(context.Background(), false); err != nil {
@@ -85,6 +88,31 @@ func TestDispatchOnceRecordsPublisherFailure(t *testing.T) {
 		if value, ok := arg.(string); ok && value == "connection refused token=visible" {
 			t.Error("failure statement received an unredacted credential")
 		}
+	}
+}
+
+func TestDispatchOnceDeadLettersAMismatchedStreamPosition(t *testing.T) {
+	envelope := newEnvelope(t).WithStreamPosition(41)
+	wire, err := envelope.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := false
+	dispatcher, tx := dispatcherWithRows(t, [][]any{{
+		time.Now(), envelope.ID.String(), string(envelope.Type), int64(42), PriorityStandard, 0, wire,
+	}}, func(context.Context, event.Envelope) error {
+		published = true
+		return nil
+	})
+
+	if _, err := dispatcher.dispatchOnce(context.Background(), false); err != nil {
+		t.Fatalf("dispatchOnce: %v", err)
+	}
+	if published {
+		t.Error("publisher received an envelope whose stream position disagreed with the row")
+	}
+	if len(tx.Calls()) != 3 {
+		t.Fatalf("calls = %d, want claim, dead-letter insert, and stop-redelivery update", len(tx.Calls()))
 	}
 }
 

@@ -187,6 +187,9 @@ func TestWireFormCarriesCloudEventsMembers(t *testing.T) {
 	if _, present := decoded["dataschema"]; present {
 		t.Error("dataschema is emitted when unset; it must be omitted")
 	}
+	if _, present := decoded["streamposition"]; present {
+		t.Error("streamposition is emitted before the outbox assigns it")
+	}
 }
 
 func TestWithSchemaIsEmitted(t *testing.T) {
@@ -198,6 +201,35 @@ func TestWithSchemaIsEmitted(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), uri) {
 		t.Errorf("dataschema absent from wire form: %s", encoded)
+	}
+}
+
+func TestPublishedEnvelopeCarriesStreamPosition(t *testing.T) {
+	e := sample(t).WithStreamPosition(42)
+	if err := e.ValidatePublished(); err != nil {
+		t.Fatalf("ValidatePublished: %v", err)
+	}
+
+	encoded, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"streamposition":42`) {
+		t.Errorf("streamposition absent from wire form: %s", encoded)
+	}
+
+	var decoded Envelope
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if decoded.StreamPosition != 42 {
+		t.Errorf("streamposition = %d, want 42", decoded.StreamPosition)
+	}
+}
+
+func TestValidatePublishedRequiresStreamPosition(t *testing.T) {
+	if err := sample(t).ValidatePublished(); err == nil {
+		t.Error("ValidatePublished accepted an envelope without streamposition")
 	}
 }
 

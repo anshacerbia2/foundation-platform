@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.2.0
+  version: 1.3.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-08-13
+  last_reviewed: 2026-08-14
   parent_sad:
     - SAD-001
     - SAD-004
@@ -182,10 +182,12 @@ several attempts in the past and cannot be reconstructed.
 stuck row needs to see which was chosen rather than infer it from a message.
 
 `sequence` comes from a database sequence rather than an identity column so that it
-stays monotonic across partitions. It supplies dispatch ordering and the snapshot
-high-water mark that projection consumers resume from. It is a stream position, not
-an entity identifier, so the prohibition on exposing sequential identifiers in
-STD-GLB-002 does not apply to it.
+stays monotonic across partitions. The same value is persisted in the envelope as the
+CloudEvents extension `streamposition`; one SQL statement allocates and writes both, so
+they cannot diverge. It supplies dispatch ordering and the snapshot high-water mark
+projection consumers compare against. It is publisher-local, may contain gaps after a
+rollback, and is neither an entity identifier nor a broker offset. The prohibition on
+exposing sequential entity identifiers in STD-GLB-002 therefore does not apply to it.
 
 Partitioning is required by ADR-GLB-003 so processed blocks are truncated in bulk.
 The partition key appears in the primary key because PostgreSQL requires it. Daily
@@ -333,6 +335,7 @@ Every published event conforms to CloudEvents 1.0 in JSON:
   "time": "2026-08-10T09:14:22Z",
   "datacontenttype": "application/json",
   "dataschema": "https://schemas.scnehaux.com/organization/membership.security.revoked/1",
+  "streamposition": 10482,
   "data": {
     "membership_id": "019235f5-...",
     "principal_id": "019235f1-...",
@@ -346,10 +349,11 @@ Every published event conforms to CloudEvents 1.0 in JSON:
 }
 ```
 
-`id`, `time`, and `type` are the CloudEvents fields. The aggregate version,
-correlation, and causation identifiers the revocation design depends on live inside
-`data`, where domain-specific fields belong. Nothing the earlier envelope carried is
-lost; it is relocated to the layer that owns it.
+`id`, `time`, and `type` are CloudEvents fields. `streamposition` is the Scnehaux
+CloudEvents extension assigned by the outbox and is mandatory at the broker boundary;
+it is absent while domain code constructs the event. The aggregate version, correlation,
+and causation identifiers the revocation design depends on live inside `data`, where
+domain-specific fields belong.
 
 ### Type Naming
 
@@ -596,6 +600,8 @@ directly; the composition root of each deployable constructs and injects it.
 
 - Every published event validates against CloudEvents 1.0 with all seven required
   fields present.
+- Every published event carries a positive `streamposition`; the value equals the
+  `platform.outbox.sequence` of its stored row.
 - Event types match the naming rule, and a type without a version suffix is treated as
   major version 1.
 - A backward-incompatible schema draft fails CI.
@@ -609,8 +615,8 @@ directly; the composition root of each deployable constructs and injects it.
 ### Ordering
 
 - `sequence` is strictly increasing across partition boundaries.
-- A consumer resuming from a recorded high-water mark receives every later event and
-  no earlier one.
+- A snapshot high-water mark and buffered events with greater `streamposition`
+  reconstruct authority without a gap. Sequence gaps do not fail reconstruction.
 
 ## Security Notes
 
@@ -688,7 +694,8 @@ investigation.
    is the deciding requirement: it must be expressible as a separate topic or stream
    with its own consumer group and its own capacity, without head-of-line blocking
    behind lifecycle traffic.
-2. Whether `platform.dead_letter` remains a local table or is replaced by a broker
-   dead-letter queue once the broker is selected. The local table survives a broker
-   outage, which a broker-side queue does not, so the local table is retained until
-   evidence justifies removing it.
+2. Whether the **producer relay** dead-letter held in `platform.dead_letter` remains a
+   local table or is replaced by a broker queue once the broker is selected. It covers
+   outbox-to-broker publication only; consumer execution retry and DLQ ownership remain
+   with each consuming adapter. The local table survives a broker outage, so it is
+   retained until evidence justifies removing it.

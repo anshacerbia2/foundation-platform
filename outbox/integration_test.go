@@ -110,6 +110,7 @@ type storedRow struct {
 	sequence    int64
 	payloadKind string
 	envelopeAt  string
+	envelopePos int64
 }
 
 func readRow(ctx context.Context, p *db.Pool, eventID string) (storedRow, error) {
@@ -124,11 +125,12 @@ func readRow(ctx context.Context, p *db.Pool, eventID string) (storedRow, error)
 			       attempts,
 			       sequence,
 			       jsonb_typeof(payload),
-			       envelope ->> 'type'
+			       envelope ->> 'type',
+			       (envelope ->> 'streamposition')::bigint
 			FROM platform.outbox
 			WHERE event_id = $1`, eventID,
 		).Scan(&r.eventID, &r.eventType, &r.aggregateID, &r.priority,
-			&r.published, &r.attempts, &r.sequence, &r.payloadKind, &r.envelopeAt)
+			&r.published, &r.attempts, &r.sequence, &r.payloadKind, &r.envelopeAt, &r.envelopePos)
 	})
 	return r, err
 }
@@ -236,6 +238,10 @@ func TestSequenceAdvancesAcrossAppends(t *testing.T) {
 
 	if b.sequence <= a.sequence {
 		t.Errorf("sequence did not advance: %d then %d", a.sequence, b.sequence)
+	}
+	if a.envelopePos != a.sequence || b.envelopePos != b.sequence {
+		t.Errorf("envelope positions = %d, %d; row sequences = %d, %d",
+			a.envelopePos, b.envelopePos, a.sequence, b.sequence)
 	}
 }
 

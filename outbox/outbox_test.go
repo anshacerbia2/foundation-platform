@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -70,33 +71,35 @@ func TestAppendTargetsTheOutboxTable(t *testing.T) {
 	if !strings.Contains(sql, "platform.outbox") {
 		t.Errorf("statement does not target platform.outbox:\n%s", sql)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(sql), "INSERT") {
-		t.Errorf("statement is not an insert:\n%s", sql)
+	if !strings.Contains(sql, "INSERT INTO platform.outbox") {
+		t.Errorf("statement does not insert into platform.outbox:\n%s", sql)
 	}
 }
 
 // A column list and a VALUES list that disagree fail at execution, which here means in
 // production, because no test in this package reaches a real database.
-func TestStatementBindsEveryColumnItNames(t *testing.T) {
-	openParen := strings.Index(appendStatement, "(")
-	closeParen := strings.Index(appendStatement, ")")
-	if openParen < 0 || closeParen < openParen {
-		t.Fatalf("cannot locate the column list in:\n%s", appendStatement)
+func TestStatementBindsEveryArgument(t *testing.T) {
+	const placeholders = 6
+	for i := 1; i <= placeholders; i++ {
+		if !strings.Contains(appendStatement, fmt.Sprintf("$%d", i)) {
+			t.Errorf("statement omits placeholder $%d:\n%s", i, appendStatement)
+		}
 	}
-	columns := strings.Split(appendStatement[openParen+1:closeParen], ",")
-
-	placeholders := strings.Count(appendStatement, "$")
-
-	if len(columns) != placeholders {
-		t.Errorf("%d columns but %d placeholders:\n%s", len(columns), placeholders, appendStatement)
-	}
-
 	tx := &dbtest.Tx{}
 	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t)); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if got := len(tx.Only(t).Args); got != placeholders {
 		t.Errorf("%d arguments for %d placeholders", got, placeholders)
+	}
+}
+
+func TestAppendAssignsOnePositionToTheRowAndEnvelope(t *testing.T) {
+	if !strings.Contains(appendStatement, "nextval('platform.outbox_sequence')") {
+		t.Fatalf("append does not allocate the stream position:\n%s", appendStatement)
+	}
+	if !strings.Contains(appendStatement, "jsonb_set($6::jsonb, '{streamposition}'") {
+		t.Fatalf("append does not bind the position into the envelope:\n%s", appendStatement)
 	}
 }
 
