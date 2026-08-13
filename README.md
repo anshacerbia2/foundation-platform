@@ -82,8 +82,38 @@ requires a SAD for deployed systems. Its designs name both consuming systems in
 | :-- | :-- |
 | `outbox/`, `event/`, `inbox/`, `idempotency/` | Propagation substrate |
 | `httpapi/`, `db/`, `observability/` | Technical substrate |
+| `db/dbtest/` | A `db.Tx` that records statements, for packages forbidden from naming the driver |
+| `migrations/platform/` | The platform schema, embedded and shipped to consumers |
 | `contracts/events/` | Versioned event schemas |
 | `docs/designs/` | Technical Design Documents |
+
+## The platform schema
+
+This module owns no database. It is a library with no deployable, and EAD-003 forbids
+cross-domain persistence, so there is nowhere for one to live.
+
+The `platform` schema exists once inside **each** consuming database — `identity-control`'s
+and `organization-control`'s. Those two copies are unrelated and never joined. The shared
+name reflects shared code, not shared storage.
+
+The SQL lives here because it must move in lockstep with the code that queries it. A
+column added to `platform.outbox` and a change to `outbox.Append` are one change, and
+splitting them across repositories permits a deployment where one has shipped and the
+other has not.
+
+Consumers receive it through `go.mod` rather than by copying:
+
+```go
+import "github.com/anshacerbia2/foundation-platform/migrations"
+
+set, err := migrations.PlatformMigrations()  // ordered by file name
+// or hand migrations.Platform, an fs.FS, to Atlas or another runner
+```
+
+This package applies nothing. Applying the schema is DDL, and
+TDD-foundation-platform-001 requires migration to run under a role distinct from the
+runtime role, which holds no DDL privilege at all. That role belongs to the consuming
+system's migration job, not to a library linked into its application.
 
 ## Designs
 
@@ -99,9 +129,10 @@ requires a SAD for deployed systems. Its designs name both consuming systems in
 | Go 1.26 | everything | `go.mod` declares 1.25 as the language floor; CI builds on 1.26 |
 | A C compiler matching `GOARCH` | `go test -race` only | The race detector is implemented in C and reached through cgo |
 | `govulncheck` | the vulnerability scan | `go install golang.org/x/vuln/cmd/govulncheck@latest` |
+| PostgreSQL 17 | the integration suite only | Optional locally; CI runs one as a service container |
 
-Nothing else. No database is needed to run the test suite, and no container runtime —
-`db` is tested against a fake connection source rather than a live PostgreSQL.
+The unit suite needs no database and no container runtime. The integration suite needs
+one, and skips itself when `TEST_DATABASE_URL` is unset.
 
 The C compiler is the only prerequisite that catches people out, because a compiler
 being present is not the same as it being usable. It must emit binaries for the same
@@ -176,6 +207,26 @@ go tool cover -func=coverage.out
 percentage, and a large build tool would otherwise move a number that is meant to
 describe the library. The floor is a floor, not a target — coverage that rises by
 testing getters buys nothing.
+
+**Integration tests answer what a double cannot.** Whether the driver encodes a string as
+`uuid` and a `[]byte` as `jsonb`, and whether the shipped DDL parses at all, are defects
+that survive every test written against a fake. Point the suite at a throwaway database:
+
+```sh
+docker run --rm -d -p 5432:5432 \
+  -e POSTGRES_USER=platform -e POSTGRES_PASSWORD=platform -e POSTGRES_DB=platform_test \
+  postgres:17-alpine
+
+TEST_DATABASE_URL='postgres://platform:platform@localhost:5432/platform_test?sslmode=disable' \
+  go test ./... -count=1
+```
+
+The suite drops and rebuilds the `platform` schema on every run, so it never passes
+against state an earlier run left behind.
+
+Set `REQUIRE_INTEGRATION=1` to turn a skip into a failure. CI sets it, because a service
+container that never came up would otherwise leave every database test skipped and the
+run green — indistinguishable from having checked something.
 
 **Architecture rules are asserted against the package graph**, not against text.
 `tools/archcheck` reads `go list -json`, so an import introduced through an alias, a

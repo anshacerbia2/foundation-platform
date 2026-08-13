@@ -15,8 +15,8 @@ Week numbers are relative to the first build week, not calendar dates.
 | `.github/workflows/ci.yml` | **done** | Green on `ci #3`; every gate has now executed at least once, including the two that had never run |
 | `db` | **done** | `InTx` semantics unit-tested with no database; 75.7% coverage |
 | `db/dbtest` | **done** | Records statements instead of running them, so packages above `db` test without a database and without naming the driver; 100% coverage |
-| `migrations/platform` | **authored** | Full `platform` schema per the design. Not yet applied — see the note below |
-| `outbox` | **partial** | `Append` done, 94.1% coverage. Dispatcher, lease, retry, and dead-letter routing remain |
+| `migrations` | **done** | Full `platform` schema, embedded and shipped through `go.mod`; applied and asserted by the integration suite |
+| `outbox` | **partial** | `Append` done and verified against PostgreSQL. Dispatcher, lease, retry, and dead-letter routing remain |
 | `inbox` | not started | — |
 | `idempotency` | not started | — |
 | `httpapi` | not started | No database dependency; can proceed in parallel with `db` |
@@ -31,17 +31,21 @@ Shipped-package coverage is **88.1%** against an 80% floor. Coverage excludes `t
 which is verified by its own tests rather than by a percentage; including a large tool
 would let it depress a figure meant to describe the library.
 
-**`migrations/platform` is authored but unapplied, and nothing has executed it.** The SQL
-is complete against the design's data model, and it has never met a PostgreSQL parser.
-Two things follow, and both are unverified rather than merely untested:
+**The two previously unverified claims now have a gate.** CI runs a `postgres:17-alpine`
+service container, applies the shipped schema, and asserts what only a database can
+answer: that the DDL parses, that the driver encodes an identifier as `uuid` and a
+`[]byte` as `jsonb`, that the column defaults leave a row unpublished with zero attempts,
+that `sequence` advances, that the row reaches a partition, and that a failure injected
+after the append leaves nothing behind.
 
-- The DDL may not parse. No local database exists, and Atlas is absent.
-- `outbox.Append` sends identifiers as strings and JSON as `[]byte`. The tests assert
-  what is sent, not that the driver encodes it as `uuid` and `jsonb`. Parameter encoding
-  is exactly the class of defect a fake cannot catch.
+`REQUIRE_INTEGRATION=1` is set in CI so a service container that never came up fails the
+build. Without it a skipped suite and a passing suite are the same colour, and the skip is
+the more likely of the two to go unnoticed.
 
-The first integration test settles both, and it is the reason `outbox` is marked partial
-rather than done even for `Append`.
+This module still owns no database, and that is the design rather than a gap. It is a
+library with no deployable, EAD-003 forbids cross-domain persistence, and the `platform`
+schema exists once inside each consuming database. What CI runs is a throwaway server for
+the duration of a job, which is a test fixture and not a dependency.
 
 `db.Open`, `db.Ping`, and `db.Close` are the uncovered remainder. They need a running
 PostgreSQL and are covered by integration tests once Docker exists, which is why `db`

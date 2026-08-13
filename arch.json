@@ -17,9 +17,10 @@
     "event": ["id"],
     "inbox": ["id", "db"],
     "idempotency": ["id", "db"],
-    "outbox": ["id", "event", "db", "db/dbtest"],
+    "outbox": ["id", "event", "db", "db/dbtest", "migrations"],
     "db": [],
     "db/dbtest": ["db"],
+    "migrations": [],
     "httpapi": ["id", "observability"],
     "observability": ["id"]
   },

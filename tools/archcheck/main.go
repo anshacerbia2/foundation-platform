@@ -63,14 +63,28 @@ type deniedImport struct {
 }
 
 // pkg mirrors the subset of `go list -json` this program reads.
+//
+// XTestImports is read alongside TestImports. The two are separate lists: an internal
+// test file belongs to the package, an external one belongs to package foo_test, and go
+// list reports their imports under different keys. Reading only the first left a hole
+// through which an external test could import anything at all, which is exactly where a
+// boundary erodes first because a test is where a shortcut feels harmless.
 type pkg struct {
-	ImportPath  string
-	Dir         string
-	Name        string
-	GoFiles     []string
-	TestGoFiles []string
-	Imports     []string
-	TestImports []string
+	ImportPath   string
+	Dir          string
+	Name         string
+	GoFiles      []string
+	TestGoFiles  []string
+	XTestGoFiles []string
+	Imports      []string
+	TestImports  []string
+	XTestImports []string
+}
+
+// allImports returns every import the package pulls in, from production, internal test,
+// and external test files alike.
+func (p pkg) allImports() []string {
+	return slices.Concat(p.Imports, p.TestImports, p.XTestImports)
 }
 
 func main() {
@@ -173,7 +187,7 @@ func checkEdges(r rules, p pkg, rel string) []string {
 	var findings []string
 	seen := map[string]bool{}
 
-	for _, imp := range slices.Concat(p.Imports, p.TestImports) {
+	for _, imp := range p.allImports() {
 		if !strings.HasPrefix(imp, r.Module) {
 			continue
 		}
@@ -198,7 +212,7 @@ func checkEdges(r rules, p pkg, rel string) []string {
 
 func checkDeniedImports(r rules, p pkg, rel string) []string {
 	var findings []string
-	for _, imp := range slices.Concat(p.Imports, p.TestImports) {
+	for _, imp := range p.allImports() {
 		for denied, rule := range r.DeniedImports {
 			if imp != denied && !strings.HasPrefix(imp, denied+"/") {
 				continue

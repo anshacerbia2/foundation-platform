@@ -18,6 +18,36 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+
+    # A disposable PostgreSQL, not a shared one. This module owns no database — it is a
+    # library, and EAD-003 forbids cross-domain persistence — but the schema it ships and
+    # the parameters it binds are only verifiable against a real server. Encoding a
+    # string as uuid, a []byte as jsonb, and whether the DDL parses at all are defects
+    # that survive every test written against a double.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: platform
+          POSTGRES_DB: platform_test
+        ports:
+          - 5432:5432
+        # Without a health check the first connection races the server's startup, and the
+        # failure reads as a broken test rather than as a container that was not ready.
+        options: >-
+          --health-cmd "pg_isready -U platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://platform:platform@localhost:5432/platform_test?sslmode=disable
+      # Turns a skipped integration suite into a failure. Without it, a service container
+      # that never came up would leave every database test skipped and the run green,
+      # which is indistinguishable from having checked something.
+      REQUIRE_INTEGRATION: "1"
+
     steps:
       - uses: actions/checkout@v4
 

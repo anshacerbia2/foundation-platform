@@ -79,6 +79,26 @@ func TestTestImportsAreCheckedToo(t *testing.T) {
 	}
 }
 
+// An external test file lives in package foo_test, and go list reports its imports under
+// XTestImports rather than TestImports. Reading only the latter left a hole an external
+// test could drive anything through, and moving a file into package foo_test is a
+// one-word change nobody would flag in review.
+func TestExternalTestImportsAreCheckedToo(t *testing.T) {
+	p := pkg{ImportPath: module + "/id", XTestImports: []string{module + "/db"}}
+
+	if findings := checkEdges(testRules(), p, "id"); len(findings) != 1 {
+		t.Errorf("findings = %v, want the external test import to be caught", findings)
+	}
+}
+
+func TestExternalTestImportsAreSubjectToDenial(t *testing.T) {
+	p := pkg{ImportPath: module + "/outbox", XTestImports: []string{"github.com/jackc/pgx/v5"}}
+
+	if findings := checkDeniedImports(testRules(), p, "outbox"); len(findings) != 1 {
+		t.Errorf("findings = %v, want the denied import to be caught in an external test", findings)
+	}
+}
+
 func TestExternalAndSelfImportsAreIgnored(t *testing.T) {
 	p := pkg{
 		ImportPath: module + "/id",
