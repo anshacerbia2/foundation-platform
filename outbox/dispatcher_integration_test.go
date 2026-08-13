@@ -77,6 +77,19 @@ func deadLetterCount(ctx context.Context, t *testing.T, p *db.Pool, eventID stri
 	return n
 }
 
+func deadLetterAttempts(ctx context.Context, t *testing.T, p *db.Pool, eventID string) int {
+	t.Helper()
+
+	var n int
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT attempts FROM platform.dead_letter WHERE event_id = $1", eventID).Scan(&n)
+	}); err != nil {
+		t.Fatalf("reading dead-letter attempts: %v", err)
+	}
+	return n
+}
+
 // clearOutbox empties the tables so a test sees only the rows it wrote. TRUNCATE on the
 // partitioned parent clears every partition, which is the bulk disposal ADR-GLB-003 asks
 // partitioning for in the first place.
@@ -276,8 +289,20 @@ func TestAStandardRowIsDeadLetteredOnceItsAttemptsAreSpent(t *testing.T) {
 	if got := deadLetterCount(ctx, t, p, e.ID.String()); got != 1 {
 		t.Fatalf("%d dead-letter rows after three attempts, want 1", got)
 	}
-	if s := readState(ctx, t, p, e.ID.String()); !s.published {
+
+	s := readState(ctx, t, p, e.ID.String())
+	if !s.published {
 		t.Error("the dead-lettered row is still claimable")
+	}
+	if s.attempts != 3 {
+		t.Errorf("attempts = %d, want 3", s.attempts)
+	}
+
+	// The closed row and its incident record must tell the same story. A row carrying a
+	// failure class and an error message but a stale attempt count describes a failure
+	// that never happened.
+	if dl := deadLetterAttempts(ctx, t, p, e.ID.String()); dl != s.attempts {
+		t.Errorf("dead_letter.attempts = %d but outbox.attempts = %d; the two records disagree", dl, s.attempts)
 	}
 }
 

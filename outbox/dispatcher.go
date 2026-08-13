@@ -304,9 +304,14 @@ ON CONFLICT (event_id) DO NOTHING`
 // claiming it. published here means "no longer this dispatcher's concern" rather than
 // "delivered", which is why published_at stays null and the incident lives in
 // platform.dead_letter.
+//
+// It records the attempt count as well. A row closed with a failure class and an error
+// message but attempts still at its previous value describes a failure that never
+// happened, and an operator reading it would draw the wrong conclusion about what the
+// event cost. The closed row and its dead-letter row must agree.
 const stopRedeliveryStatement = `UPDATE platform.outbox
-SET published = TRUE, last_error = $3, failure_class = $4, next_attempt_at = NULL,
-    first_failed_at = COALESCE(first_failed_at, now())
+SET published = TRUE, attempts = $5, last_error = $3, failure_class = $4,
+    next_attempt_at = NULL, first_failed_at = COALESCE(first_failed_at, now())
 WHERE created_at = $1 AND event_id = $2`
 
 func (d *Dispatcher) fail(ctx context.Context, tx db.Tx, row claimed, class FailureClass, detail string) error {
@@ -319,7 +324,7 @@ func (d *Dispatcher) fail(ctx context.Context, tx db.Tx, row claimed, class Fail
 			return fmt.Errorf("outbox: dead-lettering %s: %w", row.eventID, err)
 		}
 		if _, err := tx.Exec(ctx, stopRedeliveryStatement,
-			row.createdAt, row.eventID, detail, string(class)); err != nil {
+			row.createdAt, row.eventID, detail, string(class), attempts); err != nil {
 			return fmt.Errorf("outbox: closing %s after dead-letter: %w", row.eventID, err)
 		}
 		return nil
