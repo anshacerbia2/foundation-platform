@@ -314,7 +314,11 @@ func TestTheAppendedRowLandsInAPartition(t *testing.T) {
 	var partition string
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx,
-			"SELECT tableoid::regclass::text FROM platform.outbox WHERE event_id = $1", e.ID.String(),
+			`SELECT format('%I.%I', n.nspname, c.relname)
+			 FROM platform.outbox AS o
+			 JOIN pg_class AS c ON c.oid = o.tableoid
+			 JOIN pg_namespace AS n ON n.oid = c.relnamespace
+			 WHERE o.event_id = $1`, e.ID.String(),
 		).Scan(&partition)
 	}); err != nil {
 		t.Fatalf("locating the partition: %v", err)
@@ -341,7 +345,11 @@ func TestPartitionMaintenanceMovesDefaultRowsIntoTheDailyPartition(t *testing.T)
 	var partition string
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx,
-			"SELECT tableoid::regclass::text FROM platform.outbox WHERE event_id = $1", e.ID.String(),
+			`SELECT format('%I.%I', n.nspname, c.relname)
+			 FROM platform.outbox AS o
+			 JOIN pg_class AS c ON c.oid = o.tableoid
+			 JOIN pg_namespace AS n ON n.oid = c.relnamespace
+			 WHERE o.event_id = $1`, e.ID.String(),
 		).Scan(&partition)
 	}); err != nil {
 		t.Fatalf("locating moved row: %v", err)
