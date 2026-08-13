@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anshacerbia2/foundation-platform/db"
 	"github.com/anshacerbia2/foundation-platform/event"
@@ -301,6 +302,12 @@ func TestTheUnpublishedIndexExists(t *testing.T) {
 func TestTheAppendedRowLandsInAPartition(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := migrations.EnsureOutboxPartitions(ctx, tx, time.Now(), time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("ensuring today's partition: %v", err)
+	}
 
 	e, _ := appendOne(ctx, t, p)
 
@@ -313,8 +320,110 @@ func TestTheAppendedRowLandsInAPartition(t *testing.T) {
 		t.Fatalf("locating the partition: %v", err)
 	}
 
-	if partition == "" || partition == "platform.outbox" {
+	if partition == "" || partition == "platform.outbox" || partition == "platform.outbox_default" {
 		t.Errorf("row reports partition %q; it did not land in a child partition", partition)
 	}
 	t.Logf("row landed in %s", partition)
+}
+
+func TestPartitionMaintenanceMovesDefaultRowsIntoTheDailyPartition(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	e, _ := appendOne(ctx, t, p)
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := migrations.EnsureOutboxPartitions(ctx, tx, time.Now(), time.Now())
+		return err
+	}); err != nil {
+		t.Fatalf("ensuring today's partition: %v", err)
+	}
+
+	var partition string
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT tableoid::regclass::text FROM platform.outbox WHERE event_id = $1", e.ID.String(),
+		).Scan(&partition)
+	}); err != nil {
+		t.Fatalf("locating moved row: %v", err)
+	}
+	want := "platform.outbox_" + time.Now().UTC().Format("20060102")
+	if partition != want {
+		t.Errorf("row partition = %q, want %q", partition, want)
+	}
+}
+
+func TestPartitionRetentionKeepsUnpublishedRowsAndDropsPublishedOnes(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	day := time.Now().UTC().AddDate(0, 0, -40).Truncate(24 * time.Hour)
+	partition := "outbox_" + day.Format("20060102")
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		if _, err := migrations.EnsureOutboxPartitions(ctx, tx, day, day); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO platform.outbox
+			(event_id, event_type, aggregate_id, payload, envelope, created_at)
+			VALUES (gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
+			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1)`, day.Add(time.Hour))
+		return err
+	}); err != nil {
+		t.Fatalf("preparing retained partition: %v", err)
+	}
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		dropped, err := migrations.DropPublishedOutboxPartitions(ctx, tx, day.Add(48*time.Hour))
+		if err != nil {
+			return err
+		}
+		if len(dropped) != 0 {
+			t.Errorf("dropped partition with unpublished data: %v", dropped)
+		}
+		_, err = tx.Exec(ctx, `UPDATE platform.outbox SET published = TRUE
+			WHERE created_at >= $1 AND created_at < $2`, day, day.Add(24*time.Hour))
+		return err
+	}); err != nil {
+		t.Fatalf("retention with unpublished row: %v", err)
+	}
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		dropped, err := migrations.DropPublishedOutboxPartitions(ctx, tx, day.Add(48*time.Hour))
+		if err != nil {
+			return err
+		}
+		if len(dropped) != 1 || dropped[0] != partition {
+			t.Errorf("dropped = %v, want %s", dropped, partition)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("dropping published partition: %v", err)
+	}
+}
+
+func TestSequenceAdvancesAcrossPartitionBoundaries(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	firstDay := time.Now().UTC().AddDate(0, 0, -20).Truncate(24 * time.Hour)
+	secondDay := firstDay.Add(24 * time.Hour)
+	var firstSequence, secondSequence int64
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		if _, err := migrations.EnsureOutboxPartitions(ctx, tx, firstDay, secondDay); err != nil {
+			return err
+		}
+		statement := `INSERT INTO platform.outbox
+			(event_id, event_type, aggregate_id, payload, envelope, published, created_at)
+			VALUES (gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
+			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, TRUE, $1)
+			RETURNING sequence`
+		if err := tx.QueryRow(ctx, statement, firstDay.Add(time.Hour)).Scan(&firstSequence); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, statement, secondDay.Add(time.Hour)).Scan(&secondSequence)
+	}); err != nil {
+		t.Fatalf("writing across partitions: %v", err)
+	}
+	if secondSequence <= firstSequence {
+		t.Errorf("sequence across partitions = %d then %d", firstSequence, secondSequence)
+	}
 }

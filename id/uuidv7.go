@@ -169,6 +169,9 @@ func Parse(s string) (UUID, error) {
 			return Nil, ErrInvalid
 		}
 	}
+	if u.IsNil() {
+		return Nil, ErrInvalid
+	}
 	return u, nil
 }
 

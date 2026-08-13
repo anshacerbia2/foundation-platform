@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,7 +182,7 @@ func TestPoisonDeadLettersOnTheFirstFailure(t *testing.T) {
 	clearOutbox(ctx, t, p)
 
 	e, _ := appendOne(ctx, t, p)
-	pub := &fakePublisher{err: fmt.Errorf("unregistered type: %w", ErrPoison)}
+	pub := &fakePublisher{err: fmt.Errorf("unregistered type token=visible: %w", ErrPoison)}
 	d := newTestDispatcher(t, p, pub, Config{})
 
 	if _, err := d.dispatchOnce(ctx, false); err != nil {
@@ -204,6 +205,9 @@ func TestPoisonDeadLettersOnTheFirstFailure(t *testing.T) {
 	}
 	if s.attempts != 1 {
 		t.Errorf("attempts = %d, want 1", s.attempts)
+	}
+	if s.lastError == nil || strings.Contains(*s.lastError, "visible") || !strings.Contains(*s.lastError, "[REDACTED]") {
+		t.Errorf("last_error was not safely redacted: %v", s.lastError)
 	}
 }
 
@@ -411,6 +415,37 @@ func TestTheStandardLaneTakesPriorityRowsFirst(t *testing.T) {
 	}
 	if pub.published[0].ID != urgent.ID {
 		t.Errorf("published %s first, want the priority event %s", pub.published[0].ID, urgent.ID)
+	}
+}
+
+func TestTenThousandLifecycleRowsDoNotDelayPriorityClaim(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	clearOutbox(ctx, t, p)
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := tx.Exec(ctx, `INSERT INTO platform.outbox
+			(event_id, event_type, aggregate_id, priority, payload, envelope)
+			SELECT gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
+			       gen_random_uuid(), $1, '{}'::jsonb, '{}'::jsonb
+			FROM generate_series(1, 10000)`, PriorityStandard)
+		return err
+	}); err != nil {
+		t.Fatalf("creating lifecycle backlog: %v", err)
+	}
+	urgent, _ := appendOne(ctx, t, p, Priority())
+	pub := &fakePublisher{}
+	d := newTestDispatcher(t, p, pub, Config{BatchSize: 1})
+
+	started := time.Now()
+	if _, err := d.dispatchOnce(ctx, false); err != nil {
+		t.Fatalf("dispatchOnce: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("priority claim took %v with a 10,000-row lifecycle backlog", elapsed)
+	}
+	if pub.count() != 1 || pub.published[0].ID != urgent.ID {
+		t.Errorf("first published event was not priority %s", urgent.ID)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -96,6 +97,93 @@ func TestAnUnimplementedMethodPanics(t *testing.T) {
 	}()
 
 	_ = tx.Commit(context.Background())
+}
+
+func TestQueryRowScansConfiguredValuesAndRecordsTheCall(t *testing.T) {
+	tx := &Tx{RowValues: []any{"value", int32(7), nil}}
+	var text string
+	var number int
+	var absent *string
+	if err := tx.QueryRow(context.Background(), "SELECT $1", "arg").Scan(&text, &number, &absent); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if text != "value" || number != 7 || absent != nil {
+		t.Errorf("values = %q, %d, %v", text, number, absent)
+	}
+	if call := tx.Only(t); call.Args[0] != "arg" {
+		t.Errorf("recorded call = %+v", call)
+	}
+}
+
+func TestQueryRowReportsConfiguredAndScanErrors(t *testing.T) {
+	injected := errors.New("query failed")
+	if err := (&Tx{RowErr: injected}).QueryRow(context.Background(), "SELECT").Scan(); !errors.Is(err, injected) {
+		t.Errorf("Scan error = %v", err)
+	}
+	if err := (&Tx{RowValues: []any{"value"}}).QueryRow(context.Background(), "SELECT").Scan(); err == nil {
+		t.Error("Scan accepted the wrong destination count")
+	}
+	var incompatible int
+	if err := (&Tx{RowValues: []any{"value"}}).QueryRow(context.Background(), "SELECT").Scan(&incompatible); err == nil {
+		t.Error("Scan accepted an incompatible destination")
+	}
+	if err := (&Tx{RowValues: []any{"value"}}).QueryRow(context.Background(), "SELECT").Scan("not-a-pointer"); err == nil {
+		t.Error("Scan accepted a non-pointer destination")
+	}
+}
+
+func TestQueryIteratesRowsAndReportsTerminalError(t *testing.T) {
+	injected := errors.New("stream interrupted")
+	tx := &Tx{Rows: [][]any{{"first"}, {"second"}}, RowsErr: injected}
+	rows, err := tx.Query(context.Background(), "SELECT values")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, value)
+	}
+	if strings.Join(got, ",") != "first,second" || !errors.Is(rows.Err(), injected) {
+		t.Errorf("rows = %v, error = %v", got, rows.Err())
+	}
+}
+
+func TestQueryReportsImmediateFailure(t *testing.T) {
+	injected := errors.New("query rejected")
+	if _, err := (&Tx{QueryErr: injected}).Query(context.Background(), "SELECT"); !errors.Is(err, injected) {
+		t.Errorf("Query error = %v", err)
+	}
+}
+
+func TestRowsValuesRequireACurrentRow(t *testing.T) {
+	rows, err := (&Tx{Rows: [][]any{{"value"}}}).Query(context.Background(), "SELECT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rows.Values(); err == nil {
+		t.Error("Values succeeded before Next")
+	}
+	if !rows.Next() {
+		t.Fatal("Next returned false")
+	}
+	values, err := rows.Values()
+	if err != nil || len(values) != 1 || values[0] != "value" {
+		t.Errorf("Values = %v, %v", values, err)
+	}
+	if rows.FieldDescriptions() != nil || rows.RawValues() != nil || rows.Conn() != nil {
+		t.Error("recording rows exposed driver metadata")
+	}
+	_ = rows.CommandTag()
+}
+
+func TestCommandTagReportsRowsAffected(t *testing.T) {
+	if got := CommandTag(9).RowsAffected(); got != 9 {
+		t.Errorf("rows affected = %d", got)
+	}
 }
 
 // recordingTB captures a failure instead of ending the test, so a test can assert that

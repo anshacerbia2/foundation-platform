@@ -9,6 +9,16 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func TestIsNilTxRecognizesATypedNil(t *testing.T) {
+	var tx *fakeTx
+	if !IsNilTx(tx) {
+		t.Error("IsNilTx rejected a typed nil transaction")
+	}
+	if !IsNilTx(nil) {
+		t.Error("IsNilTx rejected a nil transaction")
+	}
+}
+
 // fakeTx embeds the driver interface without satisfying it. Only the methods this
 // package calls are implemented, so any other call panics on a nil interface — which
 // asserts, structurally, that InTx touches nothing beyond commit and rollback.

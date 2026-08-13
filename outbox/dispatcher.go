@@ -11,6 +11,7 @@ import (
 
 	"github.com/anshacerbia2/foundation-platform/db"
 	"github.com/anshacerbia2/foundation-platform/event"
+	"github.com/anshacerbia2/foundation-platform/redact"
 )
 
 // transactor is the slice of db.Pool the dispatcher needs.
@@ -262,7 +263,7 @@ func (d *Dispatcher) settle(ctx context.Context, tx db.Tx, row claimed) error {
 
 	if err := d.publisher.Publish(ctx, envelope); err != nil {
 		class := classify(err)
-		return d.fail(ctx, tx, row, class, err.Error())
+		return d.fail(ctx, tx, row, class, redact.String(err.Error()))
 	}
 
 	return d.markPublished(ctx, tx, row)

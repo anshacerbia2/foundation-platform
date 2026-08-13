@@ -16,10 +16,9 @@
 // version as the dispatcher that reads it. Copying the file would recreate the divergence
 // this module exists to prevent.
 //
-// This package does not apply anything. Applying the schema is DDL, and
-// TDD-foundation-platform-001 requires migration to run under a role distinct from the
-// runtime role, which holds no DDL privilege. That role belongs to the consuming system's
-// migration job, not to a library linked into its application.
+// This package applies nothing automatically. The consuming system's migration job
+// applies the embedded set and invokes partition maintenance through an explicit
+// transaction opened with its migration role. Runtime roles hold no DDL privilege.
 package migrations
 
 import (

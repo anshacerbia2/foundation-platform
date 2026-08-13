@@ -13,6 +13,9 @@ package dbtest
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"reflect"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -43,6 +46,21 @@ type Tx struct {
 	// Tag is the command tag Exec reports. The zero value reports no rows affected.
 	Tag pgconn.CommandTag
 
+	// RowValues are copied into the destinations passed to QueryRow().Scan.
+	RowValues []any
+
+	// RowErr, when set, is returned by QueryRow().Scan.
+	RowErr error
+
+	// Rows are returned by Query in order.
+	Rows [][]any
+
+	// QueryErr, when set, is returned directly by Query.
+	QueryErr error
+
+	// RowsErr is reported after Query rows are exhausted.
+	RowsErr error
+
 	calls []Call
 }
 
@@ -58,6 +76,129 @@ func (t *Tx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag
 	}
 	return t.Tag, nil
 }
+
+// QueryRow records the statement and returns a row backed by RowValues.
+func (t *Tx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	t.calls = append(t.calls, Call{SQL: sql, Args: args})
+	return row{values: t.RowValues, err: t.RowErr}
+}
+
+// Query records the statement and returns the configured result set.
+func (t *Tx) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	t.calls = append(t.calls, Call{SQL: sql, Args: args})
+	if t.QueryErr != nil {
+		return nil, t.QueryErr
+	}
+	return &rows{values: t.Rows, err: t.RowsErr}, nil
+}
+
+// CommandTag constructs a command tag without leaking the driver into a caller's tests.
+func CommandTag(rowsAffected int64) pgconn.CommandTag {
+	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", rowsAffected))
+}
+
+type row struct {
+	values []any
+	err    error
+}
+
+func (r row) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	return scan(r.values, dest)
+}
+
+func scan(values []any, dest []any) error {
+	if len(dest) != len(values) {
+		return fmt.Errorf("dbtest: Scan has %d destinations for %d values", len(dest), len(values))
+	}
+
+	for i := range dest {
+		if dest[i] == nil {
+			continue
+		}
+		dst := reflect.ValueOf(dest[i])
+		if dst.Kind() != reflect.Pointer || dst.IsNil() {
+			return fmt.Errorf("dbtest: Scan destination %d is not a non-nil pointer", i)
+		}
+		if values[i] == nil {
+			dst.Elem().SetZero()
+			continue
+		}
+
+		src := reflect.ValueOf(values[i])
+		if src.Type().AssignableTo(dst.Elem().Type()) {
+			dst.Elem().Set(src)
+			continue
+		}
+		if src.Type().ConvertibleTo(dst.Elem().Type()) {
+			dst.Elem().Set(src.Convert(dst.Elem().Type()))
+			continue
+		}
+		return fmt.Errorf("dbtest: Scan value %d of type %s cannot populate %s", i, src.Type(), dst.Elem().Type())
+	}
+	return nil
+}
+
+var _ pgx.Row = row{}
+
+type rows struct {
+	values  [][]any
+	err     error
+	current int
+	closed  bool
+}
+
+func (r *rows) Close() { r.closed = true }
+
+func (r *rows) Err() error {
+	if !r.closed {
+		return nil
+	}
+	return r.err
+}
+
+func (r *rows) CommandTag() pgconn.CommandTag { return pgconn.CommandTag{} }
+
+func (r *rows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+
+func (r *rows) Next() bool {
+	if r.closed || r.current >= len(r.values) {
+		r.Close()
+		return false
+	}
+	r.current++
+	return true
+}
+
+func (r *rows) Scan(dest ...any) error {
+	if r.current == 0 || r.current > len(r.values) {
+		r.Close()
+		return errors.New("dbtest: Scan called without a current row")
+	}
+	if err := scan(r.values[r.current-1], dest); err != nil {
+		r.Close()
+		return err
+	}
+	return nil
+}
+
+func (r *rows) Values() ([]any, error) {
+	if r.current == 0 || r.current > len(r.values) {
+		return nil, errors.New("dbtest: Values called without a current row")
+	}
+	return append([]any(nil), r.values[r.current-1]...), nil
+}
+
+func (r *rows) RawValues() [][]byte { return nil }
+
+func (r *rows) Conn() *pgx.Conn { return nil }
+
+var _ pgx.Rows = (*rows)(nil)
+
+// ErrNoRows is returned by tests that need to model a query with no result.
+var ErrNoRows = errors.New("dbtest: no rows")
 
 // Calls reports every statement in the order it was sent.
 func (t *Tx) Calls() []Call { return t.calls }

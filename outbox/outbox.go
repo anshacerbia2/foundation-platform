@@ -92,7 +92,7 @@ VALUES ($1, $2, $3, $4, $5, $6)`
 // only the publishing system knows. An option that must always be supplied is an
 // argument wearing the wrong clothes.
 func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope, opts ...Option) error {
-	if tx == nil {
+	if db.IsNilTx(tx) {
 		return ErrNoTransaction
 	}
 	if aggregateID.IsNil() {

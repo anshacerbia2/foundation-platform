@@ -114,3 +114,26 @@ func TestPlatformFilesystemIsRootedAtTheMigrations(t *testing.T) {
 		}
 	}
 }
+
+func TestSchemaCarriesMaintenanceAndScopedIdempotencyContracts(t *testing.T) {
+	migrations, err := PlatformMigrations()
+	if err != nil {
+		t.Fatalf("PlatformMigrations: %v", err)
+	}
+	var schema string
+	for _, migration := range migrations {
+		schema += migration.SQL
+	}
+	for _, fragment := range []string{
+		"PRIMARY KEY (scope, key)",
+		"idempotency_key_scope_valid",
+		"processed_event_consumer_valid",
+		"platform.ensure_outbox_partitions",
+		"platform.drop_outbox_partitions",
+		"published = FALSE",
+	} {
+		if !strings.Contains(schema, fragment) {
+			t.Errorf("platform schema omits %q", fragment)
+		}
+	}
+}

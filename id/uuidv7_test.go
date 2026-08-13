@@ -146,6 +146,12 @@ func TestStringRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseRejectsTheNilIdentifier(t *testing.T) {
+	if _, err := Parse("00000000-0000-0000-0000-000000000000"); err == nil {
+		t.Error("Parse accepted the nil identifier")
+	}
+}
+
 func TestStringForm(t *testing.T) {
 	u := MustParse("019235f1-8c4a-7c1e-9d0b-3f4a2b6e5d71")
 	if got := u.String(); got != "019235f1-8c4a-7c1e-9d0b-3f4a2b6e5d71" {

@@ -33,6 +33,7 @@ it is worth more than the coupling one shared dependency introduces.
 | `db` | Pool construction and the transaction manager that binds outbox writes to domain writes |
 | `db/dbtest` | A `db.Tx` that records statements, so packages forbidden from naming the driver can still be tested |
 | `observability` | Tracing, metrics, structured logging, correlation propagation |
+| `redact` | Credential redaction for logs, problem documents, and persisted failure detail |
 | `contracts/events` | Versioned event schemas exchanged between the two systems |
 
 ## The one rule
@@ -83,7 +84,7 @@ requires a SAD for deployed systems. Its designs name both consuming systems in
 | Path | Contents |
 | :-- | :-- |
 | `outbox/`, `event/`, `inbox/`, `idempotency/` | Propagation substrate |
-| `httpapi/`, `db/`, `observability/` | Technical substrate |
+| `httpapi/`, `db/`, `observability/`, `redact/` | Technical substrate |
 | `db/dbtest/` | A `db.Tx` that records statements, for packages forbidden from naming the driver |
 | `migrations/platform/` | The platform schema, embedded and shipped to consumers |
 | `contracts/events/` | Versioned event schemas |
@@ -112,10 +113,23 @@ set, err := migrations.PlatformMigrations()  // ordered by file name
 // or hand migrations.Platform, an fs.FS, to Atlas or another runner
 ```
 
-This package applies nothing. Applying the schema is DDL, and
-TDD-foundation-platform-001 requires migration to run under a role distinct from the
-runtime role, which holds no DDL privilege at all. That role belongs to the consuming
-system's migration job, not to a library linked into its application.
+The migration job also owns daily partition maintenance. Both helpers require an
+explicit transaction opened with the migration role:
+
+```go
+err := migrationPool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+    if _, err := migrations.EnsureOutboxPartitions(ctx, tx, today, today.AddDate(0, 0, 7)); err != nil {
+        return err
+    }
+    _, err := migrations.DropPublishedOutboxPartitions(ctx, tx, today.AddDate(0, 0, -30))
+    return err
+})
+```
+
+This package applies nothing automatically. Schema application and partition maintenance
+are DDL, and TDD-foundation-platform-001 requires both to run under a role distinct from
+the runtime role, which holds no DDL privilege. That role belongs to the consuming
+system's migration job, not to its application process.
 
 ## Designs
 
@@ -169,6 +183,39 @@ A publisher signals an unfixable failure by wrapping `outbox.ErrPoison`. Everyth
 treated as a broker that may return, which is deliberate — an unrecognised error is never
 poison, because discarding a revocation costs more than three wasted retries.
 
+## Consuming an event
+
+The inbox guard and the effect share one transaction. The composite key includes the
+logical consumer, so several consumers in one deployable may each process one event once:
+
+```go
+err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+    first, err := inbox.Guard(ctx, tx, consumerName, envelope.ID, envelope.Type)
+    if err != nil || !first {
+        return err
+    }
+    return projection.Apply(ctx, tx, envelope)
+})
+```
+
+`idempotency.Claim` similarly scopes an HTTP mutation key to the authenticated caller.
+The claim, mutation, outbox append, and `idempotency.Complete` belong in one transaction.
+A matching completed claim returns a stored response; a different digest returns
+`idempotency.ErrConflict`; an unfinished matching claim returns
+`idempotency.ErrInProgress`.
+
+## HTTP and telemetry
+
+`httpapi.Chain` fixes middleware order while the consumer supplies authentication,
+authorization, and mutation idempotency hooks. `httpapi.NewServer` applies bounded
+transport defaults, and every error written by `httpapi.Problem` comes from the compiled
+RFC 7807 registry.
+
+`observability.New` receives process-owned OpenTelemetry providers and a `slog.Logger`.
+It starts no exporter. Correlation is propagated or generated at the HTTP boundary,
+embedded in event data through `observability.MetadataFromContext`, restored by the
+consumer, and linked to the producer span by `StartConsumer`.
+
 ## Prerequisites
 
 | | Required for | Notes |
@@ -213,6 +260,7 @@ go vet ./...
 go build ./...
 go test ./... -race -count=1
 go run ./tools/archcheck
+go run ./tools/schemacheck
 go mod tidy && git diff --exit-code go.mod go.sum
 govulncheck ./...
 ```
@@ -236,9 +284,9 @@ least once:
   and confirming it was reported.
 
 **Tests do not require infrastructure.** `db` exercises transaction semantics against a
-fake whose `pgx.Tx` is embedded but not implemented, so any call beyond commit and
-rollback panics on a nil interface. That is a structural assertion, not a mock: it
-proves `InTx` touches nothing else, and it keeps failing if that stops being true.
+fake whose `pgx.Tx` is embedded but not implemented, so any unconfigured call panics on a
+nil interface. `db/dbtest` records execs, rows, and result sets for packages above the
+driver boundary. These are structural assertions rather than behaviour-rich mocks.
 
 `db.Open`, `db.Ping`, and `db.Close` are consequently uncovered. They need a running
 PostgreSQL and belong to integration tests, not to this suite.
@@ -287,5 +335,6 @@ outbox schema, or the dispatcher contract is a minor version at minimum, and bot
 consumers upgrade deliberately rather than by rebuild.
 
 `contracts/events` holds event schemas until the enterprise Schema Registry required
-by STD-GLB-004 is operational. The CI compatibility check runs against the committed
-history in the meantime; the location changes later, the rule does not.
+by STD-GLB-004 is operational. `tools/schemacheck` rejects removed properties, changed
+types, newly required properties, unsafe paths, and malformed registry entries. The
+location changes later; the compatibility rule does not.

@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.1.0
+  version: 1.2.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-08-10
+  last_reviewed: 2026-08-13
   parent_sad:
     - SAD-001
     - SAD-004
@@ -278,18 +278,21 @@ prohibits indefinite retention:
 
 ```sql
 CREATE TABLE platform.idempotency_key (
-    key            TEXT        PRIMARY KEY,
+    scope          TEXT        NOT NULL,
+    key            TEXT        NOT NULL,
     request_digest TEXT        NOT NULL,
     response_status INTEGER,
     response_body  JSONB,
     claimed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at   TIMESTAMPTZ
+    completed_at   TIMESTAMPTZ,
+    PRIMARY KEY (scope, key)
 );
 ```
 
-A repeated key carrying a different `request_digest` is rejected with `409`. A
-repeated key carrying the same digest replays the stored response without re-executing
-the operation.
+A key is scoped to the authenticated caller. A repeated scoped key carrying a different
+`request_digest` is rejected with `409`. A repeated scoped key carrying the same digest
+replays the stored response without re-executing the operation. One caller cannot claim
+or replay another caller's key.
 
 ### Isolation Posture of the `platform` Schema
 
@@ -306,8 +309,10 @@ protection is not row-level isolation but the boundary STD-GLB-002 §5.2 require
 - the application runtime role does not own these tables and holds neither `SUPERUSER`
   nor `BYPASSRLS`;
 - migration runs under a separate role and the runtime role holds no DDL privilege;
-- no interface exposes a `platform` table to a tenant-facing caller, and no query path
-  reaches it other than the dispatcher, the inbox guard, and the idempotency claim.
+- no interface exposes a `platform` table to a tenant-facing caller, and runtime query
+  paths reach it only through the dispatcher, inbox guard, and idempotency claim;
+- partition maintenance reaches it only through the migration role, which already owns
+  the DDL boundary.
 
 An implementer who adds RLS here breaks the dispatcher. An implementer who never
 considers the exposure leaves a cross-tenant surface unexamined. Both outcomes come
@@ -394,8 +399,12 @@ package inbox
 // Guard registers the event as processed inside the caller's transaction and
 // reports whether this delivery is the first. A false result means the effect
 // has already been applied and the delivery must be acknowledged and dropped.
-func Guard(ctx context.Context, tx pgx.Tx, consumer string, eventID uuid.UUID) (first bool, err error)
+func Guard(ctx context.Context, tx db.Tx, consumer string, eventID id.UUID, eventType event.Type) (first bool, err error)
 ```
+
+`eventType` was added during implementation because `platform.processed_event.event_type`
+is mandatory operational evidence and cannot be derived from `eventID`. Taking the
+validated value object prevents the guard from persisting an invented or empty type.
 
 `Append` takes a transaction rather than opening one, which is what makes the atomic
 guarantee structural: there is no way to publish outside a domain transaction.

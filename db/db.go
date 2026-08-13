@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,6 +29,21 @@ import (
 // buys is the property that matters: one package names the driver, and the boundary
 // check enforces it.
 type Tx = pgx.Tx
+
+// IsNilTx reports both a nil interface and an interface containing a typed nil pointer.
+// The latter commonly appears when a transaction double is passed through db.Tx.
+func IsNilTx(tx Tx) bool {
+	if tx == nil {
+		return true
+	}
+	v := reflect.ValueOf(tx)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
 
 // SessionBinder is invoked at the start of every transaction opened through a Pool,
 // inside that transaction.

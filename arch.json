@@ -15,14 +15,15 @@
   "internalEdges": {
     "id": [],
     "event": ["id"],
-    "inbox": ["id", "db"],
-    "idempotency": ["id", "db"],
-    "outbox": ["id", "event", "db", "db/dbtest", "migrations"],
+    "inbox": ["id", "event", "db", "db/dbtest"],
+    "idempotency": ["db", "db/dbtest"],
+    "outbox": ["id", "event", "db", "db/dbtest", "migrations", "redact"],
     "db": [],
     "db/dbtest": ["db"],
-    "migrations": [],
-    "httpapi": ["id", "observability"],
-    "observability": ["id"]
+    "migrations": ["db", "db/dbtest"],
+    "httpapi": ["id", "observability", "redact"],
+    "observability": ["id", "redact"],
+    "redact": []
   },
 
   "pureSegments": ["domain"],

@@ -9,39 +9,40 @@ Week numbers are relative to the first build week, not calendar dates.
 
 | Package | State | Evidence |
 | :-- | :-- | :-- |
-| `id` | **done** | UUIDv7 per RFC 9562, monotonic counter in `rand_a`; 96.8% coverage |
+| `id` | **done** | UUIDv7 per RFC 9562, monotonic counter in `rand_a`, nil identifiers rejected |
 | `event` | **done** | CloudEvents 1.0 envelope and validated type; 90.8% coverage |
 | `tools/archcheck` | **done** | 18 tests over fixtures, including that each rule rejects a known violation, and that an external test package is checked like any other |
-| `.github/workflows/ci.yml` | **done** | Green on `ci #8` with the full suite: race detector, PostgreSQL service container, coverage floor, boundaries, tidy, `govulncheck` |
-| `db` | **done** | `InTx` semantics unit-tested with no database; 75.7% coverage |
-| `db/dbtest` | **done** | Records statements instead of running them, so packages above `db` test without a database and without naming the driver; 100% coverage |
-| `migrations` | **done** | Full `platform` schema, embedded and shipped through `go.mod`; applied and asserted by the integration suite |
-| `outbox` | **done** | `Append` and the dispatcher: claim with `SKIP LOCKED`, two lanes, poison and unavailable classification, backoff, dead-letter routing |
-| `inbox` | not started | — |
-| `idempotency` | not started | — |
-| `httpapi` | not started | No database dependency; can proceed in parallel with `db` |
-| `observability` | not started | No database dependency; can proceed in parallel with `db` |
-| `contracts/events` | not started | Holds schemas until the enterprise registry exists |
+| `.github/workflows/ci.yml` | **done** | Race detector, PostgreSQL service, coverage floor, boundaries, schema compatibility, tidy, scheduled `govulncheck`; third-party actions pinned by commit |
+| `db` | **done** | `InTx` and session binding semantics unit-tested; typed-nil transaction handles rejected safely |
+| `db/dbtest` | **done** | Records exec, query-row, and result-set behavior without leaking the driver above `db/` |
+| `migrations` | **done** | Embedded schema plus UTC daily partition creation, default-row relocation, and published-only retention drop |
+| `outbox` | **done** | Append, two-lane dispatcher, retry/dead letter, persisted-error redaction, retention helpers, and 10,000-row priority proof |
+| `inbox` | **done** | Transactional composite-key guard over `(event_id, consumer)`; 100% unit coverage |
+| `idempotency` | **done** | Caller-scoped claim, digest conflict, in-progress state, completion, and stored-response replay |
+| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and RFC 7807 registry |
+| `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
+| `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
+| `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
 
 `arch.json` already declares the internal edges for every package above, so an
 accidental coupling introduced while writing them fails the build rather than
 accumulating.
 
-Coverage is measured against an 80% floor, excludes `tools/`, and **is only meaningful in
-CI**. A local run without a database reports around 71%, because the dispatcher's entire
-suite is integration tests that skip themselves. The number to read is the one CI prints,
-where they run.
+Coverage is measured against an 80% floor and excludes `tools/`. The unit-only run is
+83.6%, so a missing PostgreSQL service can no longer hide behind integration coverage.
+CI additionally runs every PostgreSQL behavior test with `REQUIRE_INTEGRATION=1`.
 
 That is a property of the code rather than a gap in it: claim ordering, `SKIP LOCKED`
 disjointness, backoff scheduling, and dead-letter routing are all statements about what
 PostgreSQL does, and a fake asserting them would only be asserting itself.
 
-**The two previously unverified claims now have a gate.** CI runs a `postgres:17-alpine`
+**The database-specific claims have a gate.** CI runs a `postgres:17-alpine`
 service container, applies the shipped schema, and asserts what only a database can
 answer: that the DDL parses, that the driver encodes an identifier as `uuid` and a
 `[]byte` as `jsonb`, that the column defaults leave a row unpublished with zero attempts,
-that `sequence` advances, that the row reaches a partition, and that a failure injected
-after the append leaves nothing behind.
+that sequence advances across partitions, that the default partition is drained into a
+daily partition, that retention cannot drop an unpublished row, and that a failure
+injected after the append leaves nothing behind.
 
 `REQUIRE_INTEGRATION=1` is set in CI so a service container that never came up fails the
 build. Without it a skipped suite and a passing suite are the same colour, and the skip is
@@ -69,9 +70,8 @@ authentication, so the path was live rather than merely present in the module gr
 Raised to v0.39.0.
 
 Worth recording because the finding required no commit on our part and the same is true
-of the next one. A scheduled run would move that discovery off the critical path of
-whatever is being pushed at the time; the workflow is currently triggered by push and
-pull request only.
+of the next one. CI now runs the supply-chain job weekly in addition to push and pull
+request, so new advisories do not wait for an unrelated code change.
 
 ## Environment findings
 
@@ -135,31 +135,25 @@ at the composition root, so this library provides the call site and
 - ✅ Dispatcher: `FOR UPDATE SKIP LOCKED`, reserved priority lane, the row lock as lease
 - ✅ Three local retries with exponential backoff and equal jitter, then dead-letter
 - ✅ Empty-poll backoff, so an idle dispatcher stops waking the database on a timer
-- `inbox.Guard` deduplication, transactional with the effect
+- ✅ `inbox.Guard` deduplication, transactional with the effect
 
 **Exit:** a domain mutation and its outbox append commit atomically, proven by injecting
 a failure between them; a lifecycle backlog of ten thousand rows does not delay a
 priority event beyond budget; duplicate delivery produces one effect.
 
-Two of the three are proven. Atomicity is asserted against PostgreSQL by injecting a
-failure after the append and counting the rows left behind, and lane precedence is
-asserted by claiming with a batch of one. The backlog figure is a load characteristic
-rather than a unit of behaviour and belongs to Week 3.
-
-`inbox.Guard` is the only item left, and it is what turns the broker's at-least-once
-delivery into exactly-once processing. Its key is `(event_id, consumer)` and not
-`event_id`: one deployable runs several logical consumers over the same event, and under a
-single-column key the first to record its row makes every other one observe a conflict,
-report `first = false`, and acknowledge without applying its effect. For a revocation that
-is silent non-enforcement rather than an error.
+All three library guarantees are implemented. Atomicity is asserted against PostgreSQL,
+the 10,000-row backlog test claims the priority event first within budget, and
+`inbox.Guard` uses one `INSERT ... ON CONFLICT` in the caller's effect transaction.
+Consuming systems still own their end-to-end test that the domain effect and guard commit
+together, because the effect itself deliberately does not exist in this repository.
 
 ## Week 2 · Technical substrate
 
-- Pool construction and the transaction manager
-- RFC 7807 problem serialization and the error taxonomy
-- Routing and middleware: correlation, request logging, panic recovery
-- OpenTelemetry tracing, metrics, structured logging
-- Correlation propagation across the broker boundary
+- ✅ Pool construction and the transaction manager
+- ✅ RFC 7807 problem serialization and the error taxonomy
+- ✅ Middleware and server substrate: correlation, logging, recovery, timeout, shedding
+- ✅ OpenTelemetry tracing, metrics, and redacted structured logging
+- ✅ Correlation propagation and producer-consumer span links across the broker boundary
 
 **Exit:** a correlation identifier survives from an inbound HTTP request through a
 domain transaction, into an outbox row, across the broker, and into the consumer's
@@ -171,9 +165,9 @@ span.
 - ✅ Two-replica dispatcher contention — two dispatchers claim disjoint halves of a batch
   while both hold their claims open, so the assertion is about `SKIP LOCKED` rather than
   about one finishing before the other starts
-- Partition creation job and retention drop
-- A lifecycle backlog of ten thousand rows does not delay a priority event beyond budget
-- Ordering guarantee across partition boundaries
+- ✅ Partition creation API, default-row relocation, and published-only retention drop
+- ✅ A lifecycle backlog of ten thousand rows does not delay a priority event beyond budget
+- ✅ Ordering guarantee across partition boundaries
 - Tag `v0.1.0` and pin both consumers to it
 
 **Exit:** both consuming repositories build against a tagged version rather than a
@@ -209,9 +203,11 @@ A pull request adding any of these is rejected on principle, not on review prefe
 
 **Design gate.** Both designs at `1.0.0`, with the broker adapter interface fixed.
 
-**Release gate.** The design gate, plus: partition lifecycle exercised end to end,
-dead-letter triage runbook written, ✅ dispatcher contention proven under two replicas,
-and a tagged version consumed by both control repositories.
+**Release gate.** The design gate, plus: ✅ partition lifecycle exercised end to end,
+✅ dead-letter and substrate runbooks written, ✅ dispatcher contention proven under two
+replicas, and a tagged version consumed by both control repositories. Tagging and consumer
+pinning are the only remaining steps and intentionally happen after this revision is
+reviewed, committed, pushed, and green in CI.
 
 ## Departures from the designs, recorded
 
@@ -226,6 +222,8 @@ of the design never has to know this file exists.
 | Three columns added: `next_attempt_at`, `first_failed_at`, `failure_class` | TDD-001 §Data Model |
 | A released priority row keeps its attempt count rather than resetting it | TDD-001 §Dispatch |
 | `event_id` is not enforced unique in the outbox | TDD-001 §Data Model, already recorded in the design |
+| `inbox.Guard` takes `event.Type` because `processed_event.event_type` is mandatory | TDD-001 §Go Surface |
+| Idempotency is keyed by authenticated caller scope as required by TDD-002 middleware order | TDD-001 §Idempotency |
 
 The last one predates implementation. The rest were found by writing the code, which is
 the usual way a design's internal contradictions surface.
