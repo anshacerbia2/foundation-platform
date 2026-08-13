@@ -58,8 +58,8 @@ BEGIN
     LOCK TABLE platform.outbox_default IN ACCESS EXCLUSIVE MODE;
 
     FOR day_start IN
-        SELECT from_day + offset
-        FROM generate_series(0, through_day - from_day) AS offset
+        SELECT from_day + day_offset
+        FROM generate_series(0, through_day - from_day) AS days(day_offset)
     LOOP
         child_name := 'outbox_' || to_char(day_start, 'YYYYMMDD');
         qualified_child := format('platform.%I', child_name);

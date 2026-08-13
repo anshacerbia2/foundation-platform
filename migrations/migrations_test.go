@@ -130,6 +130,7 @@ func TestSchemaCarriesMaintenanceAndScopedIdempotencyContracts(t *testing.T) {
 		"processed_event_consumer_valid",
 		"platform.ensure_outbox_partitions",
 		"platform.drop_outbox_partitions",
+		"AS days(day_offset)",
 		"published = FALSE",
 	} {
 		if !strings.Contains(schema, fragment) {
