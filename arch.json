@@ -17,8 +17,9 @@
     "event": ["id"],
     "inbox": ["id", "db"],
     "idempotency": ["id", "db"],
-    "outbox": ["id", "event", "db"],
+    "outbox": ["id", "event", "db", "db/dbtest"],
     "db": [],
+    "db/dbtest": ["db"],
     "httpapi": ["id", "observability"],
     "observability": ["id"]
   },
@@ -30,7 +31,7 @@
   "deniedImports": {
     "github.com/jackc/pgx": {
       "reason": "only db/ names the driver; every other package takes db.Tx, so the driver is named in one place rather than in every service signature",
-      "except": ["db"]
+      "except": ["db", "db/dbtest"]
     }
   },
 

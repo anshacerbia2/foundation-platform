@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-002
   title: HTTP Substrate, Persistence, and Telemetry
   owner: Core Platform Team
-  version: 1.0.0
+  version: 1.1.0
   status: approved
   classification: restricted
   review_cycle_days: 90

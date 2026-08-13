@@ -14,21 +14,34 @@ Week numbers are relative to the first build week, not calendar dates.
 | `tools/archcheck` | **done** | 16 tests over fixtures, including that each rule rejects a known violation |
 | `.github/workflows/ci.yml` | **done** | Green on `ci #3`; every gate has now executed at least once, including the two that had never run |
 | `db` | **done** | `InTx` semantics unit-tested with no database; 75.7% coverage |
-| `outbox` | next | `db.Tx` now exists, so `Append` can require the handle |
+| `db/dbtest` | **done** | Records statements instead of running them, so packages above `db` test without a database and without naming the driver; 100% coverage |
+| `migrations/platform` | **authored** | Full `platform` schema per the design. Not yet applied — see the note below |
+| `outbox` | **partial** | `Append` done, 94.1% coverage. Dispatcher, lease, retry, and dead-letter routing remain |
 | `inbox` | not started | — |
 | `idempotency` | not started | — |
 | `httpapi` | not started | No database dependency; can proceed in parallel with `db` |
 | `observability` | not started | No database dependency; can proceed in parallel with `db` |
 | `contracts/events` | not started | Holds schemas until the enterprise registry exists |
-| `migrations/platform` | not started | Atlas; needs Atlas installed |
 
 `arch.json` already declares the internal edges for every package above, so an
 accidental coupling introduced while writing them fails the build rather than
 accumulating.
 
-Shipped-package coverage is **88.0%** against an 80% floor. Coverage excludes `tools/`,
+Shipped-package coverage is **88.1%** against an 80% floor. Coverage excludes `tools/`,
 which is verified by its own tests rather than by a percentage; including a large tool
 would let it depress a figure meant to describe the library.
+
+**`migrations/platform` is authored but unapplied, and nothing has executed it.** The SQL
+is complete against the design's data model, and it has never met a PostgreSQL parser.
+Two things follow, and both are unverified rather than merely untested:
+
+- The DDL may not parse. No local database exists, and Atlas is absent.
+- `outbox.Append` sends identifiers as strings and JSON as `[]byte`. The tests assert
+  what is sent, not that the driver encodes it as `uuid` and `jsonb`. Parameter encoding
+  is exactly the class of defect a fake cannot catch.
+
+The first integration test settles both, and it is the reason `outbox` is marked partial
+rather than done even for `Append`.
 
 `db.Open`, `db.Ping`, and `db.Close` are the uncovered remainder. They need a running
 PostgreSQL and are covered by integration tests once Docker exists, which is why `db`

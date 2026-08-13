@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 0.1.0
+  version: 1.1.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -172,14 +172,38 @@ The partition key appears in the primary key because PostgreSQL requires it. Dai
 partitions are created ahead of time by a scheduled job, and partitions whose rows
 are fully published and older than the retention window are dropped.
 
+A `DEFAULT` partition exists so an insert never fails for want of one. The append runs
+inside the caller's domain transaction, so a missing daily partition would abort a
+membership revocation — a security state change lost because a scheduled job did not run.
+That is worse than the cost the default partition carries, which is that attaching a new
+range partition must first scan it for conflicting rows. Rows landing there are an
+operational defect rather than a resting place, and a non-empty default is alerted at the
+missing-future-partition threshold in §Operational Notes.
+
+**Recorded deviation from STD-GLB-004.** That standard names `event_id` as the outbox
+primary key and its exception clause reads *None*. PostgreSQL requires the partition
+key in the primary key of a partitioned table, and a `UNIQUE (event_id)` constraint is
+unavailable for the same reason, so `event_id` alone is not enforced unique here. The
+two enterprise rules are in genuine tension, and partitioning wins because ADR-GLB-003
+requires it and the alternative is row-by-row deletion on a hot table.
+
+The deviation is contained rather than resolved. Consumers deduplicate against
+`platform.processed_event`, where `event_id` is part of an enforced unique key, so
+exactly-once processing does not depend on outbox uniqueness. A duplicate `event_id`
+across two partitions would publish twice and be discarded once at each consumer. It is
+recorded here because this design quotes STD-GLB-004's no-exception clause and then
+takes one, and an unrecorded deviation is how a standard quietly stops meaning
+anything.
+
 ### Deduplication
 
 ```sql
 CREATE TABLE platform.processed_event (
-    event_id     UUID        PRIMARY KEY,
+    event_id     UUID        NOT NULL,
     consumer     TEXT        NOT NULL,
     event_type   TEXT        NOT NULL,
-    processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (event_id, consumer)
 );
 ```
 
@@ -187,6 +211,14 @@ A consumer checks this table inside the same transaction that applies the effect
 the insert conflicts, the delivery is acknowledged and discarded. Exactly-once
 processing is achieved here, at the consumer, because the broker guarantees only
 at-least-once delivery.
+
+The key is `(event_id, consumer)` and not `event_id` alone. One deployable runs several
+logical consumers over the same event: `identity-control` applies a context projection,
+removes Keycloak sessions, and translates the event onward. With `event_id` as the sole
+key, the first of those to record its row would cause every other one to observe a
+conflict, return `first = false`, and **acknowledge the delivery without applying its
+effect**. For a revocation event that is silent non-enforcement rather than an error,
+which is the failure mode this key shape exists to prevent.
 
 ### Dead Letter
 
@@ -210,6 +242,18 @@ A row here means an event was accepted by a domain transaction and never reached
 consumer. For a priority event that is a containment failure, so the alert on this
 table is not a queue-depth alert.
 
+`failure_class` is the field the dispatcher branches on, and only `poison` reaches this
+table from the priority lane. Retention is bounded because the retained `envelope` and
+`payload` carry restricted identity and organization context, and EAD-003 §5.4.5
+prohibits indefinite retention:
+
+- A resolved row is disposed after `DEAD_LETTER_RETENTION` measured from `resolved_at`.
+- An unresolved row is never disposed. Its age is alerted at
+  `DEAD_LETTER_MAX_UNRESOLVED_AGE` so the table forces escalation rather than
+  accumulating undelivered security events.
+- Disposal removes `envelope` and `payload` and retains `event_id`, `event_type`,
+  `failure_class`, and timestamps, so the incident record survives the data it carried.
+
 ### Idempotency
 
 ```sql
@@ -226,6 +270,28 @@ CREATE TABLE platform.idempotency_key (
 A repeated key carrying a different `request_digest` is rejected with `409`. A
 repeated key carrying the same digest replays the stored response without re-executing
 the operation.
+
+### Isolation Posture of the `platform` Schema
+
+Row-Level Security is **deliberately not applied** to any table in this schema, and the
+reason is a query model rather than an oversight. The dispatcher must claim every
+unpublished row regardless of which tenant a payload concerns; a tenant predicate bound
+from `app.tenant_id` would return zero rows to it. STD-GLB-002 §5.1 carves out exactly
+this case as a store whose query model makes RLS inapplicable.
+
+The consequence has to be stated rather than left implicit. `payload` and `envelope`
+carry tenant-scoped data, so **this schema is a cross-tenant readable surface**. Its
+protection is not row-level isolation but the boundary STD-GLB-002 §5.2 requires:
+
+- the application runtime role does not own these tables and holds neither `SUPERUSER`
+  nor `BYPASSRLS`;
+- migration runs under a separate role and the runtime role holds no DDL privilege;
+- no interface exposes a `platform` table to a tenant-facing caller, and no query path
+  reaches it other than the dispatcher, the inbox guard, and the idempotency claim.
+
+An implementer who adds RLS here breaks the dispatcher. An implementer who never
+considers the exposure leaves a cross-tenant surface unexamined. Both outcomes come
+from silence, which is why this subsection exists.
 
 ## API / Interface
 
@@ -282,11 +348,25 @@ package outbox
 
 // Append writes an event inside the caller's transaction. It is the only
 // supported publication path; there is no direct broker client in this module.
-func Append(ctx context.Context, tx pgx.Tx, e event.Envelope, opt ...Option) error
+func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope, opt ...Option) error
 
 // Priority marks an event for the reserved dispatch lane.
 func Priority() Option
 ```
+
+Two details of this signature were settled during implementation and are recorded here
+because the earlier draft read differently.
+
+`aggregateID` is a parameter and not an `Option`. The column is `NOT NULL` and its value
+cannot be derived inside this package: the aggregate identifier lives in the payload,
+whose shape only the publishing system knows. An option that every caller must supply is
+an argument in the wrong clothes, and expressing it as one would let a caller omit it and
+fail at the database instead of at the call site.
+
+The handle is typed `db.Tx` rather than `pgx.Tx`. `db.Tx` is an alias for it, so nothing
+changes at runtime, but the driver is then named in one package rather than in every
+signature that carries a transaction. `arch.json` asserts that boundary, and this is the
+signature it applies to.
 
 ```go
 package inbox
@@ -334,10 +414,23 @@ for each claimed row:
     on acknowledgement:
         published = TRUE, published_at = now()
     on failure:
-        attempts = attempts + 1, record last_error
-        if attempts >= 3:
+        classify: poison, or unavailable
+        attempts = attempts + 1, record last_error and failure_class
+
+        if failure_class = poison:
+            -- invalid envelope, unserializable payload, unregistered type.
+            -- retrying cannot help, so no attempts are spent on it.
             move to platform.dead_letter, mark published to stop redelivery
             raise the dead-letter alert
+
+        else if attempts >= OUTBOX_MAX_ATTEMPTS:
+            if priority = 0:
+                reset attempts, release to the unpublished pool
+                escalate the claim backoff, raise the undelivered-priority alert
+            else:
+                move to platform.dead_letter, mark published
+                raise the dead-letter alert
+
         else:
             release for retry after backoff
 ```
@@ -345,9 +438,28 @@ for each claimed row:
 Priority `0` carries security events and `100` carries lifecycle events. Two workers
 are reserved for the priority lane so a lifecycle backlog cannot delay a revocation.
 
-Retry uses exponential backoff with jitter, bounded at three local attempts as
-STD-GLB-004 requires. Empty polls back off so an idle dispatcher does not wake the
+Retry uses exponential backoff with jitter, bounded at three local attempts per claim
+as STD-GLB-004 requires. Empty polls back off so an idle dispatcher does not wake the
 database on a fixed interval.
+
+**Why a priority event is never dead-lettered for unavailability.** Dead-lettering is a
+mechanism for poison messages: three attempts then abandon is calibrated for an event
+that will never succeed. A broker outage is not that. Applying the poison rule to an
+outage discards a revocation that would have published a minute later, and the
+publisher cannot compensate — `organization-control` holds no Keycloak credential and
+cannot enforce the change itself. So a priority event exhausts its three local attempts
+per claim and then returns to the pool with escalating claim backoff, which honours the
+standard's local-retry bound without abandoning the event.
+
+**What bounds enforcement while the broker is down.** Not delivery. Each consumer
+declares `max_accepted_age` and a `stale_behavior`, and a projection that exceeds its
+accepted age under `fail_closed` denies. The enforcement bound during an outage is
+therefore the consumer's staleness policy, not the dispatcher's success. Delivery
+failure delays enforcement; it does not remove it.
+
+That leaves exactly one unbounded path: a priority event dead-lettered as **poison**.
+It is genuinely unbounded, it is a containment failure, and §Operational Notes alerts
+it at any occurrence with no threshold.
 
 Replicas contend safely because `SKIP LOCKED` lets each claim a disjoint batch.
 
@@ -382,7 +494,10 @@ check runs against the committed history. The location changes; the rule does no
 | `OUTBOX_BATCH_SIZE` | `100` | Rows claimed per cycle |
 | `OUTBOX_WORKERS` | `4` | Standard-lane workers |
 | `OUTBOX_PRIORITY_WORKERS` | `2` | Workers reserved for priority `0` |
-| `OUTBOX_MAX_ATTEMPTS` | `3` | Local retries before dead-lettering |
+| `OUTBOX_MAX_ATTEMPTS` | `3` | Local retries per claim, per STD-GLB-004 |
+| `OUTBOX_PRIORITY_CLAIM_BACKOFF_MAX` | `30s` | Ceiling on claim backoff for a repeatedly failing priority row |
+| `DEAD_LETTER_RETENTION` | `90d` | Age from `resolved_at` after which `envelope` and `payload` are removed |
+| `DEAD_LETTER_MAX_UNRESOLVED_AGE` | `24h` | Age at which an unresolved row is alerted; unresolved rows are never disposed |
 | `OUTBOX_BACKOFF_BASE` | `250ms` | Exponential backoff base with jitter |
 | `OUTBOX_PARTITION_AHEAD` | `7d` | Days of partitions pre-created |
 | `OUTBOX_RETENTION` | `30d` | Age after which fully published partitions are dropped |
@@ -405,8 +520,13 @@ directly; the composition root of each deployable constructs and injects it.
 - A backlog of ten thousand priority-`100` rows does not delay a priority-`0` event
   beyond its budget.
 - Two dispatcher replicas produce no duplicated publication and no starved row.
-- Three consecutive publication failures move the row to `platform.dead_letter` with
-  its failure class, attempt count, and first-failure timestamp.
+- Three consecutive publication failures classified `poison` move the row to
+  `platform.dead_letter` with its failure class, attempt count, and first-failure
+  timestamp.
+- A **priority** row failing repeatedly with `unavailable` is never dead-lettered: it
+  returns to the unpublished pool, its claim backoff escalates to the configured
+  ceiling, and it publishes once the broker recovers.
+- A **poison** classification dead-letters immediately without consuming retries.
 - Backoff intervals grow exponentially and carry jitter.
 
 ### Deduplication
@@ -414,7 +534,13 @@ directly; the composition root of each deployable constructs and injects it.
 - Duplicate delivery of the same `event_id` produces exactly one effect.
 - A consumer crash between effect and acknowledgement replays and produces no second
   effect.
-- Two consumers processing the same event each record their own `processed_event` row.
+- Two logical consumers in one deployable processing the same `event_id` each record
+  their own `processed_event` row and each apply their effect exactly once. This is the
+  case the composite key exists for, and a single-column key fails it.
+- A resolved dead-letter row past `DEAD_LETTER_RETENTION` loses `envelope` and
+  `payload` and retains its incident fields.
+- An unresolved dead-letter row past `DEAD_LETTER_MAX_UNRESOLVED_AGE` is alerted and
+  is not disposed.
 
 ### Envelope
 
@@ -449,8 +575,14 @@ Event payloads carry restricted identity and organization context. Structured lo
 personal data.
 
 A dead-lettered priority event means a security state change was accepted and never
-enforced. It is escalated as a containment failure rather than triaged as a delivery
-error.
+enforced. It reaches that table only when classified poison, because unavailability
+returns the row to the pool instead, and it is escalated as a containment failure
+rather than triaged as a delivery error.
+
+Retained `envelope` and `payload` in `platform.dead_letter` are the most sensitive
+slice this module holds and sit in its least-observed table. Disposal after
+`DEAD_LETTER_RETENTION` removes the payload and keeps the incident record, so the fact
+of the failure outlives the data it carried.
 
 ## Performance Notes
 
