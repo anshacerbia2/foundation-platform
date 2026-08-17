@@ -177,7 +177,16 @@ go func() { errs <- dispatcher.Run(ctx) }()
 
 `broker` is anything satisfying `outbox.Publisher`. This module holds no broker client: the
 interface is declared here because this package is what needs it, and the adapter that
-satisfies it belongs to the consuming system, whose SAD records which broker it is.
+satisfies it belongs to the consuming system.
+
+The broker protocol is fixed enterprise-wide to **Kafka** by ADR-GLB-003 §5 and
+STD-GLB-004 §3. That changes nothing in this module — no Kafka client appears in `go.mod`
+— but it constrains the adapter in two ways an author reading only this repository would
+miss. The reserved priority lane is a **separate topic** with its own consumer group and
+partition allocation, so `outbox.Priority()` selects a topic rather than a field. And
+producers partition by `aggregate_id`, because Kafka preserves order only within a
+partition while `sequence` is publisher-global; partitioning on anything else removes the
+per-aggregate ordering guarantee without failing a single test here.
 
 A publisher signals an unfixable failure by wrapping `outbox.ErrPoison`. Everything else is
 treated as a broker that may return, which is deliberate — an unrecognised error is never

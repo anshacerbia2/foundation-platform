@@ -202,16 +202,32 @@ they take their first commit, not when anything further lands here.
 
 | Decision | Owner |
 | :-- | :-- |
-| Broker product | `identity-control` and `organization-control` SADs |
+| Broker product | ADR-GLB-003 §5 and STD-GLB-004 §3 — settled, see below |
 | Token lifetime classes | STD-IAM-002 |
 | Which events exist and what they mean | The publishing system's designs |
 | Enforcement budget targets | `TDD-organization-control-002` |
 
-The broker choice is the one open item that touches this code. The reserved priority
-lane is the deciding requirement: it must be expressible as a separate topic or stream
-with its own consumer group and its own capacity, without head-of-line blocking behind
-lifecycle traffic. The dispatcher is written against an interface so the choice lands
-in one adapter.
+**The broker is settled and it is the Kafka protocol.** It was the one open item that
+touched this code. Nothing in this module changes as a result: the dispatcher publishes
+through the `Publisher` interface, the adapter satisfying it belongs to each consuming
+system, and no Kafka client appears in `go.mod`.
+
+Two consequences are worth recording because they constrain the adapter rather than this
+module, and an adapter author reading only this repository would not otherwise see them:
+
+- The reserved priority lane is a **separate topic** with its own consumer group and
+  partition allocation. `priority = 0` selects that topic; it is not a priority field
+  inside a shared one.
+- Producers partition by `aggregate_id`. Kafka preserves order only within a partition,
+  and `sequence` is publisher-global, so per-aggregate ordering is what the broker
+  actually provides. The design already tolerates cross-aggregate reordering, so this
+  costs nothing here — but an adapter partitioning on any other key silently removes the
+  per-aggregate guarantee while every test in this repository keeps passing.
+
+`contracts/events` and `tools/schemacheck` stay as the interim registry. STD-GLB-004 now
+names a Kafka-ecosystem schema registry as the target and permits source-controlled
+schemas while the compatibility check runs in CI. That interim state is debt, and it is
+recorded here rather than left to be rediscovered.
 
 ## Not this library
 

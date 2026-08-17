@@ -48,7 +48,8 @@ repository reimplements.
 - Any domain concept. This module defines no Principal, Membership, Tenant, or
   Workspace type, and holds no domain state.
 - Which events exist and what they mean — owned by the publishing system's designs.
-- Broker product selection — recorded in SAD-001 and SAD-004.
+- Broker product selection — fixed enterprise-wide by ADR-GLB-003 §5 and STD-GLB-004 §3,
+  and consumed here through the `Publisher` interface rather than a client.
 - The Keycloak projection applied on receipt — owned by the Identity Control designs.
 
 ## Technical Context
@@ -677,7 +678,7 @@ investigation.
 | :-- | :-- |
 | Parent system | SAD-001 — Scnehaux Identity Runtime |
 | Parent system | SAD-004 — Scnehaux Organization Control |
-| Governed by | ADR-GLB-003 — Transactional Outbox, Stage 1 polling and partitioning |
+| Governed by | ADR-GLB-003 — Transactional Outbox, Stage 1 polling and partitioning, and the Kafka protocol as the broker |
 | Governed by | ADR-GLB-006 — Event Versioning and Schema Evolution |
 | Conforms to | STD-GLB-004 — CloudEvents envelope, deduplication, retry and dead-letter |
 | Conforms to | STD-GLB-001 — RFC 7807 problem details |
@@ -687,14 +688,31 @@ investigation.
 | Consumed by | Identity Control designs, for Keycloak projection and session removal |
 | Consumed by | Organization Control designs, for membership authority and revocation |
 
+### Broker Product, Settled
+
+`ADR-GLB-003 §5` and `STD-GLB-004 §3` now fix the **Kafka protocol** for every
+asynchronous event in the enterprise. What that decision means for this module:
+
+- The `Publisher` interface is unchanged. The adapter satisfying it lives in each
+  consuming system, and this module still holds no broker client.
+- The reserved priority lane is a **separate topic** with its own consumer group and
+  partition allocation, not a priority field inside one topic. `priority = 0` selects
+  the topic; the column keeps its meaning as the dispatch-lane selector inside the
+  outbox.
+- Producers partition by `aggregate_id`. Kafka preserves order only within a partition,
+  and `sequence` is publisher-global, so per-aggregate ordering is the guarantee the
+  broker actually provides. This design already tolerates cross-aggregate reordering —
+  consumers reconcile by authority version and deduplicate on `event_id` — so nothing
+  in the ordering section changes. An adapter partitioning on any other key would
+  remove the per-aggregate guarantee while every test here continued to pass.
+- `contracts/events` and `tools/schemacheck` remain the interim registry. STD-GLB-004
+  now names a Kafka-ecosystem schema registry as the target and permits this repository
+  to hold schemas in source control provided the compatibility check runs in CI, which
+  it does. The interim state is recorded as debt in `ROADMAP.md`.
+
 ### Open Questions
 
-1. Broker product selection. EAD-005 delegates it to the realizing system, and
-   STD-GLB-004 accepts Kafka, RabbitMQ, or an equivalent. The reserved priority lane
-   is the deciding requirement: it must be expressible as a separate topic or stream
-   with its own consumer group and its own capacity, without head-of-line blocking
-   behind lifecycle traffic.
-2. Whether the **producer relay** dead-letter held in `platform.dead_letter` remains a
+1. Whether the **producer relay** dead-letter held in `platform.dead_letter` remains a
    local table or is replaced by a broker queue once the broker is selected. It covers
    outbox-to-broker publication only; consumer execution retry and DLQ ownership remain
    with each consuming adapter. The local table survives a broker outage, so it is
