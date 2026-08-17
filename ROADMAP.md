@@ -88,6 +88,10 @@ which are opposite requirements, so the two jobs disagree deliberately. An advis
 fix is a patch release now resolves without a commit, and what stays red is what needs a
 decision — a vulnerability in a dependency, or one with no fix yet.
 
+The durable form of that reasoning, including what the `go` directive does and does not
+promise and how to raise `GO_VERSION` when a minor bump becomes necessary, is in
+[README.md](README.md#go-versions). What is recorded here is only that it happened.
+
 ## Environment findings
 
 Recorded because each one changes how a step is verified, and a future engineer hitting

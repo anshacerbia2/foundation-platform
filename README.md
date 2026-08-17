@@ -220,7 +220,7 @@ consumer, and linked to the producer span by `StartConsumer`.
 
 | | Required for | Notes |
 | :-- | :-- | :-- |
-| Go 1.26 | everything | `go.mod` declares 1.25 as the language floor; CI builds on 1.26 |
+| Go 1.26 | everything | `go.mod` declares 1.25 as the language floor; CI builds on 1.26. The two numbers differ on purpose — see [Go versions](#go-versions) |
 | A C compiler matching `GOARCH` | `go test -race` only | The race detector is implemented in C and reached through cgo |
 | `govulncheck` | the vulnerability scan | `go install golang.org/x/vuln/cmd/govulncheck@latest` |
 | PostgreSQL 17 | the integration suite only | Optional locally; CI runs one as a service container |
@@ -248,6 +248,118 @@ toolchain on `PATH`. On Linux and macOS the system compiler already matches.
 Environment-specific findings for this workstation — proxy behaviour, install paths —
 are recorded in [ROADMAP.md](ROADMAP.md) rather than here, because they describe a
 machine rather than the repository.
+
+## Go versions
+
+Three different Go version numbers exist in this repository and they answer three
+different questions. Conflating them is the usual source of confusion, so each is
+written down separately along with what it does and does not promise.
+
+| Number | Where | Answers |
+| :-- | :-- | :-- |
+| `go 1.25.0` | `go.mod` | The oldest toolchain a **consumer** may build this module with, and the language semantics its files compile under |
+| `GO_VERSION: "1.26"` | `.github/workflows/ci.yml` | Which toolchain **CI** builds and tests with |
+| whatever is installed | a workstation | Which toolchain **you** happen to run locally |
+
+Only the first is a compatibility statement. The second is a testing choice. The third is
+an accident of how a machine was set up.
+
+### What `go 1.25.0` guarantees
+
+**A future Go release will build this module without a change here.** That is the Go 1
+compatibility promise, and since Go 1.21 it is enforced by a mechanism rather than left as
+an intention: the `go` directive fixes the language version its own module's files compile
+under, so a newer toolchain cannot silently change what this code means.
+
+The clearest example is the Go 1.22 change to `for` loop variable scoping, from one
+variable shared across iterations to one per iteration. That change applies only to modules
+declaring `go 1.22` or later. A module still declaring `go 1.21` keeps the old semantics
+even when compiled by Go 1.30. This module declares `1.25.0`, so its semantics are frozen
+at 1.25 regardless of who builds it.
+
+One boundary worth knowing, because it is easy to assume otherwise: language version is
+per-module and follows *this* `go.mod`, but `GODEBUG` defaults — which gate changes in
+standard library behaviour — come from the **main module's** `go.mod`, meaning the
+consuming program's, not this library's. A consumer that raises its own directive can
+therefore observe changed stdlib behaviour inside code compiled from here. That is the
+consumer's decision to make and its test suite that should catch it.
+
+`GOTOOLCHAIN` defaults to `auto`, so the floor is not a wall in the other direction
+either. A consumer on Go 1.24 does not fail: Go reads the `1.25.0` directive and fetches a
+matching toolchain on its own.
+
+### What `go 1.25.0` does not guarantee
+
+**It does not promise CI stays green on a newer toolchain.** The promise covers
+compilation. CI does considerably more than compile, and the rest of it is explicitly
+outside the compatibility promise:
+
+| Check | Can a Go minor bump break it? | Why |
+| :-- | :-- | :-- |
+| `go build ./...` | Practically no | This is what the promise covers |
+| `gofmt -l .` | **Yes** | Formatting rules change between releases. Go 1.19 reformatted doc comments, and every file it touched would have failed this gate until reformatted |
+| `go vet ./...` | **Yes** | Releases add analyzers. Code that passed vet last release can be reported by the next one without changing |
+| `go test ./... -race` | **Yes** | Runtime scheduling, timing, and detector sensitivity all shift; a latent race or a tight timing assertion can surface |
+| coverage floor | Rarely | Inlining and statement attribution can move the figure slightly |
+| `govulncheck ./...` | **Yes, by design** | It reports advisories against the standard library the toolchain shipped with |
+
+So the honest statement is: **raising `GO_VERSION` can fail this build, and when it does
+that is a real incompatibility between this repository and that toolchain** — just not a
+language-level one. Since CI is what decides whether a change merges, that distinction is
+academic to anyone whose pull request is red.
+
+### Why the two CI jobs disagree on purpose
+
+The `verify` job sets `check-latest: false`. The `supply-chain` job sets
+`check-latest: true`. That is not an inconsistency:
+
+- Test results have to be **reproducible**. A run today and a run in six months should
+  differ because the code differed, not because the runner image was refreshed.
+- A vulnerability scan has to be **current**. Its whole job is to answer "is the standard
+  library we build with patched", and a stale toolchain answers a stale question.
+
+The practical effect is that `check-latest: true` floats the **patch** within the pinned
+minor — 1.26.5 to 1.26.6 to 1.26.7 — and never the minor. An advisory whose fix ships in a
+patch release therefore clears itself with no commit. An advisory whose fix ships only in
+the next minor stays red until someone raises `GO_VERSION`, which is intended: that is a
+decision, and a decision should cost a commit.
+
+This has already happened once. GO-2026-6090, GO-2026-6088, and GO-2026-5972 were reported
+against `crypto/tls`, `encoding/xml`, and `encoding/asn1` while the runner had go1.26.5
+cached, and all three were fixed in go1.26.6. No change to this module could have cleared
+them. The reasoning is recorded in [ROADMAP.md](ROADMAP.md).
+
+### Raising `GO_VERSION` to a new minor
+
+Roughly twice a year, on each Go release. Do it in **its own commit**, touching nothing
+else, so that if CI turns red the cause is one visible line rather than something tangled
+with a code change.
+
+```sh
+# 1. Reproduce the new toolchain locally first.
+GOTOOLCHAIN=go1.27.0 go build ./...
+GOTOOLCHAIN=go1.27.0 gofmt -l .          # the gate most likely to fire
+GOTOOLCHAIN=go1.27.0 go vet ./...
+GOTOOLCHAIN=go1.27.0 go test ./... -race -count=1
+
+# 2. Only then raise the line in .github/workflows/ci.yml
+#    GO_VERSION: "1.26"  ->  "1.27"
+```
+
+Expect `gofmt` and `go vet` to be what fires, in that order of likelihood. Fixing either is
+mechanical — reformat, or address the new diagnostic — and belongs in the same commit,
+because the bump and the work it forces are one change.
+
+The weekly scheduled `supply-chain` run is what tells you a bump has become urgent rather
+than routine: a stdlib advisory with no patch-level fix will sit red until the minor moves.
+
+### Raising the `go` directive in `go.mod`
+
+A separate and larger decision, because it raises the floor for **both consuming
+systems**. Do it only to use a language or library feature this module actually needs, and
+never merely to match whatever CI runs — the two numbers are not supposed to track each
+other. `go.mod` declares 1.25 while CI builds on 1.26 deliberately, so that consumers are
+not forced forward by a testing choice made here.
 
 ## Verifying a change
 
