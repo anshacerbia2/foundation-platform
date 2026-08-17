@@ -12,7 +12,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `id` | **done** | UUIDv7 per RFC 9562, monotonic counter in `rand_a`, nil identifiers rejected |
 | `event` | **done** | CloudEvents 1.0 envelope and validated type; 90.8% coverage |
 | `tools/archcheck` | **done** | 18 tests over fixtures, including that each rule rejects a known violation, and that an external test package is checked like any other |
-| `.github/workflows/ci.yml` | **done** | Race detector, PostgreSQL service, coverage floor, boundaries, schema compatibility, tidy, scheduled `govulncheck`; third-party actions pinned by commit |
+| `.github/workflows/ci.yml` | **done** | Race detector, PostgreSQL service, coverage floor, boundaries, schema compatibility, tidy, scheduled `govulncheck` on a floating toolchain patch; third-party actions pinned by commit |
 | `db` | **done** | `InTx` and session binding semantics unit-tested; typed-nil transaction handles rejected safely |
 | `db/dbtest` | **done** | Records exec, query-row, and result-set behavior without leaking the driver above `db/` |
 | `migrations` | **done** | Embedded schema plus UTC daily partition creation, default-row relocation, and published-only retention drop |
@@ -29,7 +29,7 @@ accidental coupling introduced while writing them fails the build rather than
 accumulating.
 
 Coverage is measured against an 80% floor and excludes `tools/`. The unit-only run is
-83.6%, so a missing PostgreSQL service can no longer hide behind integration coverage.
+83.9%, so a missing PostgreSQL service can no longer hide behind integration coverage.
 CI additionally runs every PostgreSQL behavior test with `REQUIRE_INTEGRATION=1`.
 
 That is a property of the code rather than a gap in it: claim ordering, `SKIP LOCKED`
@@ -72,6 +72,21 @@ Raised to v0.39.0.
 Worth recording because the finding required no commit on our part and the same is true
 of the next one. CI now runs the supply-chain job weekly in addition to push and pull
 request, so new advisories do not wait for an unrelated code change.
+
+The next one arrived at the release gate. `govulncheck` reported GO-2026-6090,
+GO-2026-6088, and GO-2026-5972 — reachable paths into `crypto/tls`, `encoding/xml`, and
+`encoding/asn1`, all three fixed in go1.26.6. Nothing in this module could clear them,
+because the vulnerable code is the standard library the toolchain shipped with.
+
+`GO_VERSION` asks for `1.26`, so the patch was never chosen: the runner had go1.26.5
+cached and `check-latest` was unset. Pinning `1.26.6` would have moved the problem to the
+next advisory and made clearing it depend on someone remembering to raise a number.
+
+The supply-chain job now sets `check-latest: true` and `verify` keeps `check-latest:
+false`. Test results have to be reproducible and a vulnerability scan has to be current,
+which are opposite requirements, so the two jobs disagree deliberately. An advisory whose
+fix is a patch release now resolves without a commit, and what stays red is what needs a
+decision — a vulnerability in a dependency, or one with no fix yet.
 
 ## Environment findings
 
@@ -168,10 +183,16 @@ span.
 - ✅ Partition creation API, default-row relocation, and published-only retention drop
 - ✅ A lifecycle backlog of ten thousand rows does not delay a priority event beyond budget
 - ✅ Ordering guarantee across partition boundaries
-- Tag `v0.1.0` and pin both consumers to it
+- ✅ Tag `v0.1.0`, annotated at `dac9e9d` and pushed
+- Pin both consumers to it
 
 **Exit:** both consuming repositories build against a tagged version rather than a
 branch.
+
+`v0.1.0` exists and CI is green on `main`. The remaining half of this step does not
+belong to this repository: `identity-control` and `organization-control` hold designs and
+no Go module yet, so there is nothing to pin the tag into. This exit criterion closes when
+they take their first commit, not when anything further lands here.
 
 ## Decisions this repository does not make
 
@@ -205,9 +226,11 @@ A pull request adding any of these is rejected on principle, not on review prefe
 
 **Release gate.** The design gate, plus: ✅ partition lifecycle exercised end to end,
 ✅ dead-letter and substrate runbooks written, ✅ dispatcher contention proven under two
-replicas, and a tagged version consumed by both control repositories. Tagging and consumer
-pinning are the only remaining steps and intentionally happen after this revision is
-reviewed, committed, pushed, and green in CI.
+replicas, ✅ `v0.1.0` tagged and pushed with CI green, and a tagged version consumed by
+both control repositories.
+
+Consumer pinning is the one clause still open, and it is held by the consuming
+repositories rather than by this one. Everything this library owes the gate is done.
 
 ## Departures from the designs, recorded
 
