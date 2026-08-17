@@ -126,9 +126,21 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # The only step in this file that wants the newest toolchain rather than a stable
+      # one. govulncheck decides which standard library advisories apply from the
+      # version it builds with, so a pinned patch reports every stdlib finding fixed
+      # since that patch shipped — and clears them only when someone remembers to bump
+      # a number. Floating the patch here means an advisory whose fix is a patch release
+      # resolves itself, and what stays red is what actually needs a decision: a
+      # vulnerability in a dependency, or one with no fix yet.
+      #
+      # The verify job pins deliberately. Test results have to be reproducible; a
+      # vulnerability scan has to be current. Those are opposite requirements, which is
+      # why the two jobs disagree on purpose.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          check-latest: true
 
       # A dependency present in go.mod but absent from the build is debt that arrives
       # with a vulnerability report attached.
