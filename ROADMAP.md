@@ -23,6 +23,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
+| `verify` | **done** | Local token verification: JWKS caching with rate-limited refetch, `PS256` only, exact issuer, audience, bounded skew, and a mandatory consumer claim rule; 90.2% coverage |
 
 `arch.json` already declares the internal edges for every package above, so an
 accidental coupling introduced while writing them fails the build rather than

@@ -33,6 +33,7 @@ it is worth more than the coupling one shared dependency introduces.
 | `db` | Pool construction and the transaction manager that binds outbox writes to domain writes |
 | `db/dbtest` | A `db.Tx` that records statements, so packages forbidden from naming the driver can still be tested |
 | `observability` | Tracing, metrics, structured logging, correlation propagation |
+| `verify` | Local bearer-token verification: JWKS caching, `PS256` signature, issuer, audience, expiry |
 | `redact` | Credential redaction for logs, problem documents, and persisted failure detail |
 | `contracts/events` | Versioned event schemas exchanged between the two systems |
 
@@ -212,6 +213,54 @@ The claim, mutation, outbox append, and `idempotency.Complete` belong in one tra
 A matching completed claim returns a stored response; a different digest returns
 `idempotency.ErrConflict`; an unfinished matching claim returns
 `idempotency.ErrInProgress`.
+
+## Verifying a token
+
+Every consuming system verifies tokens, and a verifier implemented twice produces two
+verification behaviours while both report compliance. That is the same failure the dispatcher
+is shared to prevent, so the mechanism lives here.
+
+```go
+keys, err := verify.NewJWKS(verify.JWKSConfig{URL: jwksURL})
+if err != nil {
+    return err
+}
+
+verifier, err := verify.New(verify.Config{
+    Issuer:   issuer,
+    Audience: "identity-control",
+    Keys:     keys,
+    Requirement: verify.RequirementFunc(func(claims verify.Claims) error {
+        // The consumer's rule. STD-IAM-002 §3.5 requires the enterprise subject identifier
+        // on an internal-audience token, and this module is forbidden from naming it.
+        if _, ok := claims.String("principal_id"); !ok {
+            return errors.New("token carries no principal_id")
+        }
+        return nil
+    }),
+})
+```
+
+**`Requirement` is mandatory and `New` refuses without it.** This package checks the signature,
+the issuer, the audience, and the expiry — the mechanics. It cannot check what a claim means,
+because `STD-IAM-002 §3.5` states that rule in terms of a claim this module may not know. So the
+call site is here and the decision is the consumer's, exactly as `db.SessionBinder` supplies the
+tenant predicate `db` is forbidden from writing.
+
+A verifier built without a requirement would check the mechanics and look compliant, which is
+why the constructor rejects it rather than defaulting to a permissive rule.
+
+Three properties are worth knowing because getting any of them wrong is a bypass rather than a
+bug:
+
+- **The algorithm comes from configuration, never from the token.** `PS256` only. A verifier
+  that selected its path from the `alg` header accepts `none`.
+- **`jku`, `x5u`, `jwk`, and `x5c` are unreachable.** They are absent from the header struct
+  rather than parsed and ignored. Honouring any of them lets the presenter of a token nominate
+  the key that validates it, which removes the signature as a control entirely.
+- **An unknown `kid` refetches once, then rejects.** The refetch is rate limited, because the
+  key identifier is the one input an attacker chooses and an unbounded refetch turns random
+  identifiers into a denial of service against a Tier-0 dependency.
 
 ## HTTP and telemetry
 

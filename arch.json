@@ -23,7 +23,8 @@
     "migrations": ["db", "db/dbtest"],
     "httpapi": ["id", "observability", "redact"],
     "observability": ["id", "redact"],
-    "redact": []
+    "redact": [],
+    "verify": []
   },
 
   "pureSegments": ["domain"],
