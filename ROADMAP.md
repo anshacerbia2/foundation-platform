@@ -105,6 +105,32 @@ the same wall should not have to rediscover it.
 | `winget` is disabled by Group Policy | Toolchains are installed by extracting an archive, not by a package manager |
 | The C toolchain at `C:\MinGW` is MinGW.org GCC 6.3.0, which cannot emit 64-bit code | Resolved. MinGW-w64 GCC 16.2.0 extracted to `D:\mingw64`; prepend `D:\mingw64\bin` to PATH ahead of `C:\MinGW\bin` |
 | Atlas and Docker are absent on this workstation | The integration suite skips locally and runs in CI against a service container. Migrations are applied there, so the schema is exercised on every push rather than only when someone remembers |
+| Atlas is now present locally at `D:\Atlas\atlas.exe`, and PostgreSQL 15.5 is installed | The migration pipeline can be run end to end locally. It found the migration-idempotency defect below, which CI could not have found |
+
+### The platform migration set was not re-runnable
+
+This package ships migrations as embedded SQL and **no revision table**, so a consumer's
+migration command applies the whole set on every invocation. `identity-migrate` says so in
+its package comment and relies on every statement being idempotent.
+
+`0002_idempotency_scope_and_maintenance.sql` used bare `ADD COLUMN` and `ADD CONSTRAINT`.
+The first deployment therefore succeeded and every deployment after it aborted with
+`column "scope" of relation "idempotency_key" already exists`.
+
+Every other integration suite in this repository drops and rebuilds the `platform` schema
+before it runs, which is correct for isolation and is precisely why no test could see this:
+the set was only ever applied to an empty schema. Found by running `identity-control`'s
+database pipeline a second time.
+
+Fixed in `0002` with `IF NOT EXISTS` and `pg_constraint` guards — PostgreSQL has no
+`ADD CONSTRAINT IF NOT EXISTS` — and `migrations/integration_test.go` now applies the set
+three times and asserts the resulting schema. Three rather than two, because a primary key
+dropped and re-added on each run looks correct on the second application and fails on the
+third. The guard was verified to fire by restoring the original statement.
+
+That suite rolls its whole transaction back, including the schema drop. `go test ./...` runs
+package binaries concurrently against one `TEST_DATABASE_URL`, so a suite that committed
+would delete the schema the `outbox` suite is mid-way through using.
 
 The race detector now runs locally. It required a matching C compiler, because the
 detector is implemented in C and reached through cgo, and the toolchain that shipped

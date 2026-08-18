@@ -1,7 +1,19 @@
+-- Every statement in this file is re-runnable.
+--
+-- That is a hard requirement rather than a courtesy. This package ships migrations as embedded
+-- SQL and no revision table, so a consumer's migration command applies the whole set on every
+-- invocation. An earlier version of this file used bare ADD COLUMN and ADD CONSTRAINT, and the
+-- consequence was that the first deployment succeeded and every deployment after it aborted with
+-- `column "scope" of relation "idempotency_key" already exists`. Found by running the pipeline a
+-- second time.
+--
+-- PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS, so those statements are guarded on
+-- pg_constraint. See TestEveryPlatformMigrationIsIdempotent for the property this file owes.
+
 -- Scope idempotency keys to the authenticated caller. A globally keyed table lets one
 -- caller consume another caller's key, contradicting the middleware ordering contract.
 ALTER TABLE platform.idempotency_key
-    ADD COLUMN scope TEXT;
+    ADD COLUMN IF NOT EXISTS scope TEXT;
 
 -- This repository has not released a tagged version yet, but keep an upgrade path for
 -- development databases. Existing globally-scoped keys retain their mutual exclusion in
@@ -11,27 +23,77 @@ UPDATE platform.idempotency_key SET scope = '__legacy__' WHERE scope IS NULL;
 ALTER TABLE platform.idempotency_key
     ALTER COLUMN scope SET NOT NULL;
 
-ALTER TABLE platform.idempotency_key
-    ADD CONSTRAINT idempotency_key_scope_valid
-    CHECK (btrim(scope) <> '' AND octet_length(scope) <= 512),
-    ADD CONSTRAINT idempotency_key_key_valid
-    CHECK (btrim(key) <> '' AND octet_length(key) <= 255),
-    ADD CONSTRAINT idempotency_key_digest_valid
-    CHECK (btrim(request_digest) <> '' AND octet_length(request_digest) <= 256);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'platform.idempotency_key'::regclass
+          AND conname = 'idempotency_key_scope_valid'
+    ) THEN
+        ALTER TABLE platform.idempotency_key
+            ADD CONSTRAINT idempotency_key_scope_valid
+            CHECK (btrim(scope) <> '' AND octet_length(scope) <= 512);
+    END IF;
 
-ALTER TABLE platform.idempotency_key
-    DROP CONSTRAINT idempotency_key_pkey;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'platform.idempotency_key'::regclass
+          AND conname = 'idempotency_key_key_valid'
+    ) THEN
+        ALTER TABLE platform.idempotency_key
+            ADD CONSTRAINT idempotency_key_key_valid
+            CHECK (btrim(key) <> '' AND octet_length(key) <= 255);
+    END IF;
 
-ALTER TABLE platform.idempotency_key
-    ADD PRIMARY KEY (scope, key);
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'platform.idempotency_key'::regclass
+          AND conname = 'idempotency_key_digest_valid'
+    ) THEN
+        ALTER TABLE platform.idempotency_key
+            ADD CONSTRAINT idempotency_key_digest_valid
+            CHECK (btrim(request_digest) <> '' AND octet_length(request_digest) <= 256);
+    END IF;
 
-ALTER TABLE platform.processed_event
-    ADD CONSTRAINT processed_event_consumer_valid
-    CHECK (btrim(consumer) <> '' AND octet_length(consumer) <= 255);
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'platform.processed_event'::regclass
+          AND conname = 'processed_event_consumer_valid'
+    ) THEN
+        ALTER TABLE platform.processed_event
+            ADD CONSTRAINT processed_event_consumer_valid
+            CHECK (btrim(consumer) <> '' AND octet_length(consumer) <= 255);
+    END IF;
+END
+$$;
+
+-- The primary key is widened from (key) to (scope, key).
+--
+-- Decided by reading the current key rather than by attempting the change and tolerating a
+-- failure: `DROP CONSTRAINT IF EXISTS` followed by an unguarded `ADD PRIMARY KEY` would drop a
+-- correct key and then fail to replace it, leaving the table without one.
+DO $$
+DECLARE
+    current_key TEXT;
+BEGIN
+    SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+      INTO current_key
+      FROM pg_constraint c
+      CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+     WHERE c.conrelid = 'platform.idempotency_key'::regclass
+       AND c.contype = 'p';
+
+    IF current_key IS DISTINCT FROM 'scope,key' THEN
+        ALTER TABLE platform.idempotency_key DROP CONSTRAINT IF EXISTS idempotency_key_pkey;
+        ALTER TABLE platform.idempotency_key ADD PRIMARY KEY (scope, key);
+    END IF;
+END
+$$;
 
 -- Track only partitions created by the maintenance function. This avoids deriving
 -- retention boundaries from names or PostgreSQL's rendered partition expressions.
-CREATE TABLE platform.outbox_partition (
+CREATE TABLE IF NOT EXISTS platform.outbox_partition (
     partition_name TEXT PRIMARY KEY,
     range_start    TIMESTAMPTZ NOT NULL,
     range_end      TIMESTAMPTZ NOT NULL,
