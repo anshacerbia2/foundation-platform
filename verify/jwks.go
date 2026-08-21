@@ -76,7 +76,7 @@ type JWKS struct {
 }
 
 // NewJWKS constructs the key source. It performs no network access: nothing starts by being
-// linked or constructed, per STD-GLB-BE-001 rule 11. Call Refetch, or let the first unknown key
+// linked or constructed, per STD-GLB-BE-001 rule 10. Call Refetch, or let the first unknown key
 // identifier trigger it.
 func NewJWKS(cfg JWKSConfig) (*JWKS, error) {
 	cfg.applyDefaults()

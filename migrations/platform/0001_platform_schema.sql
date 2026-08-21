@@ -7,11 +7,11 @@
 -- Row-Level Security is deliberately absent from every table here, and the reason is the
 -- query model rather than an oversight. The dispatcher must claim every unpublished row
 -- regardless of which tenant a payload concerns, and a tenant predicate bound from
--- app.tenant_id would return it nothing. STD-GLB-002 §5.1 carves out exactly this case.
+-- app.tenant_id would return it nothing. STD-GLB-002 Multi-Tenancy & Isolation carves out exactly this case.
 --
 -- The consequence must be stated rather than left implicit: payload and envelope carry
 -- tenant-scoped data, so this schema is a cross-tenant readable surface. Its protection
--- is the boundary in STD-GLB-002 §5.2 — the runtime role owns no table here, holds
+-- is the boundary in STD-GLB-002 Data Ownership & Access — the runtime role owns no table here, holds
 -- neither SUPERUSER nor BYPASSRLS, and holds no DDL privilege; migration runs under a
 -- separate role; and no interface exposes a platform table to a tenant-facing caller.
 
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS platform.processed_event (
 -- outage discards a revocation that would have published a minute later.
 --
 -- Retention is bounded because envelope and payload carry restricted identity and
--- organization context, and EAD-003 §5.4.5 prohibits indefinite retention. Disposal
+-- organization context, and EAD-003 §5.4 prohibits indefinite retention. Disposal
 -- clears envelope and payload and keeps the incident fields, so the record of the failure
 -- outlives the data it carried. An unresolved row is never disposed; its age is alerted
 -- so the table forces escalation instead of accumulating undelivered security events.

@@ -66,7 +66,7 @@ func newJWKS(t *testing.T, server *httptest.Server, now func() time.Time) *verif
 	return source
 }
 
-// TestConstructionPerformsNoNetworkAccess is STD-GLB-BE-001 rule 11 asserted directly. A key
+// TestConstructionPerformsNoNetworkAccess is STD-GLB-BE-001 rule 10 asserted directly. A key
 // source that fetched on construction would make linking it a network call, and the composition
 // root could not choose when that happens.
 func TestConstructionPerformsNoNetworkAccess(t *testing.T) {

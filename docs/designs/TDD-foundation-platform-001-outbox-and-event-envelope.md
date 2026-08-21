@@ -267,7 +267,7 @@ table is not a queue-depth alert.
 
 `failure_class` is the field the dispatcher branches on, and only `poison` reaches this
 table from the priority lane. Retention is bounded because the retained `envelope` and
-`payload` carry restricted identity and organization context, and EAD-003 §5.4.5
+`payload` carry restricted identity and organization context, and EAD-003 §5.4
 prohibits indefinite retention:
 
 - A resolved row is disposed after `DEAD_LETTER_RETENTION` measured from `resolved_at`.
@@ -302,12 +302,12 @@ or replay another caller's key.
 Row-Level Security is **deliberately not applied** to any table in this schema, and the
 reason is a query model rather than an oversight. The dispatcher must claim every
 unpublished row regardless of which tenant a payload concerns; a tenant predicate bound
-from `app.tenant_id` would return zero rows to it. STD-GLB-002 §5.1 carves out exactly
+from `app.tenant_id` would return zero rows to it. STD-GLB-002 Multi-Tenancy & Isolation carves out exactly
 this case as a store whose query model makes RLS inapplicable.
 
 The consequence has to be stated rather than left implicit. `payload` and `envelope`
 carry tenant-scoped data, so **this schema is a cross-tenant readable surface**. Its
-protection is not row-level isolation but the boundary STD-GLB-002 §5.2 requires:
+protection is not row-level isolation but the boundary STD-GLB-002 Data Ownership & Access requires:
 
 - the application runtime role does not own these tables and holds neither `SUPERUSER`
   nor `BYPASSRLS`;
