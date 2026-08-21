@@ -192,3 +192,47 @@ func TestMalformedCorrelationIsNotReflected(t *testing.T) {
 		t.Errorf("correlation response = %q", got)
 	}
 }
+
+// TestEveryProblemTypeIsRegistered closes the gap that a new constant makes reachable.
+//
+// ProblemType is an iota, so adding a constant compiles whether or not the registry gained an
+// entry, and an unregistered type would reach a caller as an empty document with a zero status.
+// The loop walks the whole range rather than a hand-written list, so a constant added tomorrow is
+// covered without anyone remembering to extend this test.
+func TestEveryProblemTypeIsRegistered(t *testing.T) {
+	for kind := ValidationFailed; kind <= RequestInProgress+ProblemType(len(problemRegistry)); kind++ {
+		definition, ok := problemRegistry[kind]
+		if !ok {
+			// Past the end of the declared constants, which is where the loop is expected to stop.
+			continue
+		}
+		if definition.URI == "" || definition.Title == "" || definition.Status == 0 {
+			t.Errorf("problem type %d is registered with an incomplete definition: %+v", kind, definition)
+		}
+	}
+
+	// Count rather than range: the registry and the constant block must agree, and a constant
+	// added without an entry is exactly the omission this asserts.
+	if len(problemRegistry) != int(Internal) {
+		t.Errorf("the registry holds %d definitions and the constants declare %d; one was added without the other",
+			len(problemRegistry), int(Internal))
+	}
+}
+
+// TestRequestInProgressIsDistinctFromStateTransitionRefused states why the type was added.
+//
+// Both answer 409, and the consuming service was using the refusal type for an in-flight retry
+// because nothing better existed. The two carry opposite advice: a refused transition means no
+// retry will help, an in-progress request means the retry is what will. A client that cannot tell
+// them apart gives up when it should wait.
+func TestRequestInProgressIsDistinctFromStateTransitionRefused(t *testing.T) {
+	inProgress := problemRegistry[RequestInProgress]
+	refused := problemRegistry[StateTransitionRefused]
+
+	if inProgress.URI == refused.URI {
+		t.Error("the two types share a URI, so a client cannot distinguish them")
+	}
+	if inProgress.Status != refused.Status {
+		t.Errorf("status differs: %d and %d; both are conflicts", inProgress.Status, refused.Status)
+	}
+}

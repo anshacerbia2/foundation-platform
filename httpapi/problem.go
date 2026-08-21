@@ -19,6 +19,16 @@ const (
 	VersionConflict
 	IdempotencyKeyConflict
 	StateTransitionRefused
+
+	// RequestInProgress is a retry arriving while the original request is still running.
+	//
+	// Distinct from StateTransitionRefused, which consumers were using for it because nothing
+	// better existed. The two are the same status and different facts: a refused transition means
+	// the caller asked for something the record cannot do, and no retry will change that; an
+	// in-progress request means the caller asked for something that is happening, and retrying
+	// after a moment is the correct response. Collapsing them tells a client to give up when it
+	// should wait.
+	RequestInProgress
 	PreconditionUnmet
 	RateLimited
 	Overloaded
@@ -40,6 +50,7 @@ var problemRegistry = map[ProblemType]problemDefinition{
 	VersionConflict:        {"https://problems.scnehaux.com/version-conflict", "The record changed since it was read", http.StatusConflict},
 	IdempotencyKeyConflict: {"https://problems.scnehaux.com/idempotency-key-conflict", "The idempotency key was reused with a different request", http.StatusConflict},
 	StateTransitionRefused: {"https://problems.scnehaux.com/state-transition-refused", "The requested state transition was refused", http.StatusConflict},
+	RequestInProgress:      {"https://problems.scnehaux.com/request-in-progress", "An identical request is still in progress", http.StatusConflict},
 	PreconditionUnmet:      {"https://problems.scnehaux.com/precondition-unmet", "A request precondition was not met", http.StatusPreconditionFailed},
 	RateLimited:            {"https://problems.scnehaux.com/rate-limited", "The request rate is too high", http.StatusTooManyRequests},
 	Overloaded:             {"https://problems.scnehaux.com/overloaded", "The service is overloaded", http.StatusServiceUnavailable},

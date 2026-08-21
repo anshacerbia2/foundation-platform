@@ -19,7 +19,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `outbox` | **done** | Append, two-lane dispatcher, retry/dead letter, persisted-error redaction, retention helpers, and 10,000-row priority proof |
 | `inbox` | **done** | Transactional composite-key guard over `(event_id, consumer)`; 100% unit coverage |
 | `idempotency` | **done** | Caller-scoped claim, digest conflict, in-progress state, completion, and stored-response replay |
-| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and RFC 7807 registry |
+| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and a closed RFC 9457 registry of twelve types |
 | `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
@@ -215,15 +215,19 @@ span.
 - ✅ A lifecycle backlog of ten thousand rows does not delay a priority event beyond budget
 - ✅ Ordering guarantee across partition boundaries
 - ✅ Tag `v0.1.0`, annotated at `dac9e9d` and pushed
-- Pin both consumers to it
+- ✅ `identity-control` pins `v0.2.1`; `organization-control` holds designs and no Go module yet
 
 **Exit:** both consuming repositories build against a tagged version rather than a
 branch.
 
-`v0.1.0` exists and CI is green on `main`. The remaining half of this step does not
-belong to this repository: `identity-control` and `organization-control` hold designs and
-no Go module yet, so there is nothing to pin the tag into. This exit criterion closes when
-they take their first commit, not when anything further lands here.
+`identity-control` now builds against `v0.2.1` rather than a branch, so half of this exit
+criterion is met. `organization-control` still holds designs and no Go module, so the other
+half closes when it takes its first commit rather than when anything further lands here.
+
+Two tags followed `v0.1.0`. `v0.2.0` added `verify`; `v0.2.1` made the platform migration set
+re-runnable, which is the defect recorded under Environment findings above — the first
+deployment succeeded and every one after it aborted, and only a consumer running the pipeline
+twice could have found it.
 
 ## Decisions this repository does not make
 
@@ -297,3 +301,20 @@ of the design never has to know this file exists.
 
 The last one predates implementation. The rest were found by writing the code, which is
 the usual way a design's internal contradictions surface.
+
+### `request-in-progress` added to the problem registry
+
+`identity-control` was answering an in-flight retry with `state-transition-refused`, because the
+registry offered nothing closer. Recorded there as a finding, and the finding stayed in the
+consumer: nothing here said the registry was short a type, so whoever worked on this module next
+would not have known.
+
+Both types answer 409 and they carry opposite advice. A refused transition means the caller asked
+for something the record cannot do, and no retry will change that. An in-progress request means the
+caller asked for something that is happening, and retrying after a moment is the correct response.
+A client that cannot tell them apart gives up when it should wait.
+
+The registry is closed and compiled precisely so a handler cannot invent a type, which is the right
+constraint and is also why the gap had to be closed here rather than worked around downstream.
+`TestEveryProblemTypeIsRegistered` now walks the constant range against the map, so a constant
+added without an entry fails rather than reaching a caller as an empty document with a zero status.
