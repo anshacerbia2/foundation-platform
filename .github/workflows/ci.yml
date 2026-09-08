@@ -104,6 +104,51 @@ jobs:
             exit 1
           fi
 
+      # The dead-letter temporal boundary is load-bearing OUTSIDE this repository.
+      #
+      # dead_lettered_at names the instant a row became a dead letter. 0003 moved its
+      # default off now() -- which is the dispatcher transaction's start, and that
+      # transaction publishes over HTTP once per row in the batch before writing any of
+      # them, so the timestamp could be minutes early exactly when a batch is timing out
+      # and producing dead letters in the first place.
+      #
+      # organization-control and foundation-reference read that value as evidence that a
+      # projection generation built from a later snapshot saw the failed event's effect.
+      # An understated value lets a snapshot taken BEFORE the event committed satisfy the
+      # comparison, the incident resolves as RESNAPSHOTTED, and a revoked membership keeps
+      # being served. The reason lives in two other repositories; the value is written
+      # here, so the gate is here.
+      #
+      # A maintainer reading statement_timestamp() without that context will see an odd
+      # choice and "fix" it. This step is what stops that being silent.
+      #
+      # Matched loosely on `SET DEFAULT statement_timestamp` rather than the whole
+      # statement: foundation-reference's mutation gate went red once because a column was
+      # renamed and the literal here was not, and the not-found branch below still catches
+      # a real disappearance.
+      - name: the dead-letter temporal boundary is load-bearing
+        run: |
+          file=migrations/platform/0003_dead_letter_temporal_boundary.sql
+          cp "$file" "$file.orig"
+          sed -i -E 's/SET DEFAULT statement_timestamp\(\)/SET DEFAULT now()/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the statement_timestamp default was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          # Two tests rather than one. They fail for different reasons with the defect
+          # restored -- one that the timestamp precedes the publish attempt, one that a
+          # whole batch shares a single instant -- so running only the first would let a
+          # future change satisfy it while breaking the other.
+          if go test ./outbox -count=1 \
+              -run 'TestDeadLetteredAtNamesTheTransitionNotTheTransactionStart|TestEachDeadLetterInABatchCarriesItsOwnTransition'; then
+            echo "::error::the suite passed with DEFAULT now() restored, so it does not test the temporal boundary"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the temporal boundary is load-bearing: restoring now() fails both temporal tests"
+          mv "$file.orig" "$file"
+
       # STD-GLB-BE-001 rules 3, 4, 7, and 12, asserted against the package graph rather
       # than against text, so an import introduced through an alias, a blank identifier,
       # or a test file is detected on the same basis as a direct one.

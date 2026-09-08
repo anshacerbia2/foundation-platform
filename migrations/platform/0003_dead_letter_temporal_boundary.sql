@@ -1,0 +1,50 @@
+-- ---------------------------------------------------------------------------
+-- Dead-letter temporal boundary
+-- ---------------------------------------------------------------------------
+
+-- dead_lettered_at must name the instant the row became a dead letter. It did not.
+--
+-- The column defaulted to now(), which in PostgreSQL is transaction_timestamp() -- the
+-- instant the enclosing transaction began, not the instant this row was written. For most
+-- columns the difference is microseconds and irrelevant. For this one it is neither,
+-- because of how the dispatcher is shaped: dispatchOnce opens ONE transaction, claims a
+-- batch, and then publishes each row inside it -- an HTTP call per row, each with its own
+-- network timeout. A batch of fifty against an endpoint that is timing out therefore
+-- commits its dead letters with a timestamp minutes older than the transition it claims to
+-- name. And a batch timing out is precisely the situation that produces dead letters.
+--
+-- Two writers shared the defect: now() is also the same value for every row in the batch,
+-- while each row transitions at its own instant.
+--
+-- # Why a wrong timestamp here is a correctness problem and not a reporting one
+--
+-- This value is load-bearing outside this repository. The dead-letter resolution contract
+-- lets an authority-bearing incident be resolved as RESNAPSHOTTED when a consumer's
+-- projection generation was built from a snapshot taken after the incident -- the argument
+-- being that such a snapshot read authoritative state that already included the event's
+-- effect. That argument holds only through this chain:
+--
+--   the dispatcher's claim saw the row  => the row had committed before that statement
+--   the dead-letter write came after    => this timestamp is after the event's commit
+--   generation.started_at > this value  => the generation began after the commit
+--                                       => every page's REPEATABLE READ read sees it
+--
+-- An understated timestamp breaks the chain at the second step, and the failure is
+-- permissive: a snapshot taken BEFORE the revocation committed satisfies the comparison,
+-- the incident resolves as RESNAPSHOTTED, and a consumer keeps serving a membership that
+-- was revoked. The reason lives in organization-control and foundation-reference; the value
+-- is written here, which is why it is written out here too.
+--
+-- statement_timestamp() rather than clock_timestamp(): it is exactly the boundary the
+-- column's name claims (the instant this statement began), it differs per row within a
+-- batch as it must, and it is stable within the statement. clock_timestamp() is volatile
+-- and can move backwards across an NTP step adjustment, which is not a property to want in
+-- a value used for a correctness comparison.
+--
+-- first_failed_at is left alone deliberately. It carries the same now() defect through the
+-- dispatcher's COALESCE, but nothing derives a correctness decision from it -- the
+-- unresolved-age alert and the resolution contract both read dead_lettered_at. Recorded as
+-- P1 rather than fixed here, so this migration stays the one thing it claims to be.
+
+ALTER TABLE platform.dead_letter
+    ALTER COLUMN dead_lettered_at SET DEFAULT statement_timestamp();

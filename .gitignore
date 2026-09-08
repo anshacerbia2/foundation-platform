@@ -8,6 +8,14 @@ cov-src
 /foundation-platform
 /archcheck
 
+# Local configuration. .env holds a working database credential; .env.example is the
+# committed template and carries a placeholder. This repository is public.
+.env
+
+# Scratch left by the Makefile.
+.fmt.tmp
+*.orig
+
 # Editor and OS noise.
 .idea/
 .vscode/
