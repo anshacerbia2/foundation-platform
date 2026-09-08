@@ -302,10 +302,18 @@ WHERE created_at = $1 AND event_id = $2`
 // deadLetterStatement copies the row into platform.dead_letter, reading envelope and
 // payload from the outbox rather than from the dispatcher's memory so the two cannot
 // disagree.
+//
+// aggregate_id and priority travel with it because a dead letter has to be replayable from
+// its own row. Replaying means appending to platform.outbox again, which requires
+// aggregate_id NOT NULL and takes priority to pick the lane -- so without them a replay had
+// to read the original outbox row, and that row lives in a partition with retention. Once
+// the partition was dropped the incident record survived and the ability to act on it did
+// not. See 0004 for why that mattered: REPLAYED is the only first-hand evidence the
+// resolution contract has.
 const deadLetterStatement = `INSERT INTO platform.dead_letter
-    (event_id, event_type, envelope, payload, failure_class, failure_detail, attempts,
-     first_failed_at)
-SELECT event_id, event_type, envelope, payload, $3, $4, $5,
+    (event_id, event_type, envelope, payload, aggregate_id, priority, failure_class,
+     failure_detail, attempts, first_failed_at)
+SELECT event_id, event_type, envelope, payload, aggregate_id, priority, $3, $4, $5,
        COALESCE(first_failed_at, now())
 FROM platform.outbox
 WHERE created_at = $1 AND event_id = $2
