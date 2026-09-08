@@ -112,15 +112,34 @@ test-ci:
 MIGRATION = migrations\platform\0003_dead_letter_temporal_boundary.sql
 TEMPORAL_TESTS = TestDeadLetteredAtNamesTheTransitionNotTheTransactionStart|TestEachDeadLetterInABatchCarriesItsOwnTransition
 
-mutate:
+DISPATCHER = outbox\dispatcher.go
+REPLAY_TESTS = TestADeadLetterRetainsWhatAReplayNeeds|TestADeadLetterCanBeReplayedAfterTheOriginalIsGone
+
+mutate: mutate-temporal mutate-replay
+	@echo Both mutations went red and both files were restored.
+
+.PHONY: mutate-temporal mutate-replay
+
+mutate-temporal:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
 	@copy $(MIGRATION) $(MIGRATION).orig >nul
 	@powershell -NoProfile -Command "$$p='$(MIGRATION)'; $$t=[IO.File]::ReadAllText($$p); $$n=$$t -replace 'SET DEFAULT statement_timestamp\(\)','SET DEFAULT now()'; if ($$n -eq $$t) { exit 3 }; [IO.File]::WriteAllText($$p,$$n)" || (echo The mutation found nothing to change -- this gate is silently passing and must be updated && copy $(MIGRATION).orig $(MIGRATION) >nul && del $(MIGRATION).orig && exit 1)
 	@echo Mutated: dead_lettered_at is back to DEFAULT now(). Both temporal gates must now fail.
-	@go test ./outbox/ -run "$(TEMPORAL_TESTS)" -count=1 && (echo && echo The suite PASSED with the defect restored, so it does not test it. && copy $(MIGRATION).orig $(MIGRATION) >nul && del $(MIGRATION).orig && exit 1) || echo Both gates went red, as they must.
+	@go test ./outbox/ -run "$(TEMPORAL_TESTS)" -count=1 && (echo && echo The suite PASSED with the defect restored, so it does not test it. && copy $(MIGRATION).orig $(MIGRATION) >nul && del $(MIGRATION).orig && exit 1) || echo Temporal gates went red, as they must.
 	@copy $(MIGRATION).orig $(MIGRATION) >nul
 	@del $(MIGRATION).orig
-	@echo Restored. Re-run `make test-integration` to confirm they pass again.
+
+# The second gate, and it mutates Go rather than SQL: the dispatcher's dead-letter INSERT
+# stops retaining aggregate_id and priority, which is the state that made an old incident
+# unreplayable once its outbox partition was dropped.
+mutate-replay:
+	@if not exist .env (echo No .env yet. Run: make env && exit 1)
+	@copy $(DISPATCHER) $(DISPATCHER).orig >nul
+	@powershell -NoProfile -Command "$$p='$(DISPATCHER)'; $$t=[IO.File]::ReadAllText($$p); $$n=$$t -replace 'envelope, payload, aggregate_id, priority,','envelope, payload,'; if ($$n -eq $$t) { exit 3 }; [IO.File]::WriteAllText($$p,$$n)" || (echo The mutation found nothing to change -- this gate is silently passing and must be updated && copy $(DISPATCHER).orig $(DISPATCHER) >nul && del $(DISPATCHER).orig && exit 1)
+	@echo Mutated: the dead-letter insert no longer retains aggregate_id or priority. Both replay gates must now fail.
+	@go test ./outbox/ -run "$(REPLAY_TESTS)" -count=1 && (echo && echo The suite PASSED without the retention, so it does not test replay sufficiency. && copy $(DISPATCHER).orig $(DISPATCHER) >nul && del $(DISPATCHER).orig && exit 1) || echo Replay gates went red, as they must.
+	@copy $(DISPATCHER).orig $(DISPATCHER) >nul
+	@del $(DISPATCHER).orig
 
 # ---------------------------------------------------------------------------
 # Gates

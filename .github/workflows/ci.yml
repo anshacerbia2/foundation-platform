@@ -149,6 +149,40 @@ jobs:
           echo "the temporal boundary is load-bearing: restoring now() fails both temporal tests"
           mv "$file.orig" "$file"
 
+      # A dead letter must be replayable from its own row.
+      #
+      # Replaying means appending to platform.outbox again, which requires aggregate_id
+      # NOT NULL and takes priority to pick the lane. Retaining neither meant a replay had
+      # to read the original outbox row, and that row lives in a partition with retention:
+      # once dropped, the incident record survived and the ability to act on it did not.
+      #
+      # REPLAYED is the only first-hand evidence the dead-letter resolution contract has --
+      # the producer's own dispatcher witnessing the consumer accept the event. Every other
+      # route rests on something the consumer reports about itself. So losing replay for old
+      # incidents removes the one path that does not require trusting the party being
+      # checked.
+      - name: a dead letter retains what a replay needs
+        run: |
+          file=outbox/dispatcher.go
+          cp "$file" "$file.orig"
+          sed -i -E 's/envelope, payload, aggregate_id, priority,/envelope, payload,/g' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the dead-letter retention columns were not found in the insert; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          # Only the two tests that assert the dispatcher retains it. The backfill tests
+          # read platform.outbox directly, so they are unaffected by this mutation and
+          # including them would weaken what a red run means.
+          if go test ./outbox -count=1 \
+              -run 'TestADeadLetterRetainsWhatAReplayNeeds|TestADeadLetterCanBeReplayedAfterTheOriginalIsGone'; then
+            echo "::error::the suite passed without aggregate_id and priority retained, so it does not test replay sufficiency"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "replay sufficiency is load-bearing: dropping the retention fails both replay tests"
+          mv "$file.orig" "$file"
+
       # STD-GLB-BE-001 rules 3, 4, 7, and 12, asserted against the package graph rather
       # than against text, so an import introduced through an alias, a blank identifier,
       # or a test file is detected on the same basis as a direct one.
