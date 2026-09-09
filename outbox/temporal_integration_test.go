@@ -43,14 +43,14 @@ type parkedPoisonPublisher struct {
 	enterOnce sync.Once
 }
 
-func (b *parkedPoisonPublisher) Publish(ctx context.Context, _ event.Envelope) error {
+func (b *parkedPoisonPublisher) Publish(ctx context.Context, _ event.Envelope) (Receipt, error) {
 	b.enterOnce.Do(func() { close(b.entered) })
 
 	select {
 	case <-b.release:
-		return b.err
+		return Receipt{}, b.err
 	case <-ctx.Done():
-		return ctx.Err()
+		return Receipt{}, ctx.Err()
 	}
 }
 
@@ -196,11 +196,11 @@ type slowPoisonPublisher struct {
 	err   error
 }
 
-func (s *slowPoisonPublisher) Publish(ctx context.Context, _ event.Envelope) error {
+func (s *slowPoisonPublisher) Publish(ctx context.Context, _ event.Envelope) (Receipt, error) {
 	select {
 	case <-time.After(s.delay):
-		return s.err
+		return Receipt{}, s.err
 	case <-ctx.Done():
-		return ctx.Err()
+		return Receipt{}, ctx.Err()
 	}
 }

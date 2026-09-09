@@ -183,6 +183,36 @@ jobs:
           echo "replay sufficiency is load-bearing: dropping the retention fails both replay tests"
           mv "$file.orig" "$file"
 
+      # Applied evidence must not be claimable without the consumer's marker.
+      #
+      # A dead letter may be resolved as REPLAYED when this producer's own dispatcher
+      # witnessed the consumer accept the event -- the only evidence in the resolution
+      # contract that does not rest on the consumer's report about itself. It is worth
+      # exactly as much as the guarantee that "the consumer accepted it" was not inferred
+      # from a broker acknowledgement.
+      #
+      # Receipt's field is unexported, so an adapter in another repository cannot name the
+      # strong class at all; ReceiptFromMarker is the only route to it. This gate holds the
+      # one place that decision is made.
+      - name: applied evidence requires the consumer's marker
+        run: |
+          file=outbox/dispatch.go
+          cp "$file" "$file.orig"
+          sed -i -E 's/if marker == ApplicationReceiptApplied \{/if true {/' "$file"
+          if git diff --quiet "$file"; then
+            echo "::error::the marker comparison was not found; this check is silently passing and must be updated"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          if go test ./outbox -count=1 \
+              -run 'TestNoMarkerRecordsTransportEvidenceOnly|TestAnUnrecognisedMarkerIsNotAppliedEvidence'; then
+            echo "::error::the suite passed while every publication claimed applied evidence, so it does not test the distinction"
+            mv "$file.orig" "$file"
+            exit 1
+          fi
+          echo "the marker is load-bearing: mapping every publication to applied evidence fails both tests"
+          mv "$file.orig" "$file"
+
       # STD-GLB-BE-001 rules 3, 4, 7, and 12, asserted against the package graph rather
       # than against text, so an import introduced through an alias, a blank identifier,
       # or a test file is detected on the same basis as a direct one.

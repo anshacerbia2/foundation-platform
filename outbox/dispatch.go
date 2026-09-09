@@ -13,8 +13,94 @@ import (
 // The interface is declared here, by the consumer, rather than beside an implementation.
 // This package states what it needs from a broker; which broker satisfies it is recorded
 // in the consuming system's SAD, and the choice lands in one adapter.
+//
+// It returns a Receipt rather than only an error because "the publish succeeded" is two
+// different facts, and the dead-letter resolution contract can only use one of them. See
+// Evidence.
 type Publisher interface {
-	Publish(ctx context.Context, e event.Envelope) error
+	Publish(ctx context.Context, e event.Envelope) (Receipt, error)
+}
+
+// Evidence says what a successful publication actually established.
+//
+// The distinction is load-bearing rather than descriptive. An abandoned delivery may be
+// resolved as REPLAYED when the producer's own dispatcher witnessed the consumer accept the
+// event -- that is the only evidence in the contract which does not rest on the consumer's
+// report about itself. A broker acknowledgement establishes something much weaker: the
+// message was handed on. The consumer may still be hours behind, or gone.
+//
+// Today's transport makes the strong form available: the consumer applies the event inside
+// the same transaction as its inbox guard and only then answers, so its acknowledgement means
+// applied. The moment a broker is introduced that stops being true, and the failure would be
+// silent -- a resolution path quietly accepting "handed to the broker" as "the consumer has
+// it".
+type Evidence string
+
+const (
+	// EvidenceConsumerApplied means the consumer asserted it applied the event within the
+	// delivery it acknowledged. Resolution evidence.
+	EvidenceConsumerApplied Evidence = "consumer_applied"
+
+	// EvidenceTransportAccepted means something accepted the message for onward delivery.
+	// Adequate for dispatch bookkeeping and never adequate as resolution evidence.
+	EvidenceTransportAccepted Evidence = "transport_accepted"
+)
+
+// ApplicationReceiptHeader is the header a consumer sets to assert that it applied the event
+// before acknowledging it.
+//
+// Named here, in the producer, because the meaning of the assertion belongs to the contract
+// rather than to whichever adapter reads it.
+const ApplicationReceiptHeader = "X-Application-Receipt"
+
+// ApplicationReceiptApplied is the only value that establishes EvidenceConsumerApplied.
+const ApplicationReceiptApplied = "applied"
+
+// Receipt is what a publication established, and it cannot be forged from outside.
+//
+// The field is unexported deliberately, and this is the difference between a mechanism and a
+// convention. With an exported field, a broker adapter written six months from now would
+// simply fill in `Evidence: EvidenceConsumerApplied` on a 200 from the broker -- not out of
+// dishonesty but because it is the obvious thing to write, and it would pass review. The
+// typed result would then have bought one compile error at the moment of the change and
+// nothing afterwards.
+//
+// Unexported, the strong value is reachable only through ReceiptFromMarker, which requires
+// the consumer's own marker. A broker cannot produce that marker, because it is not the
+// consumer. So introducing a broker degrades the evidence automatically and correctly, and
+// resolution stops finding valid proof -- a loud failure instead of a quiet downgrade.
+type Receipt struct {
+	evidence Evidence
+}
+
+// Evidence reports what the publication established.
+//
+// An unset Receipt reads as EvidenceTransportAccepted rather than as empty: a publisher that
+// forgets to say what it established must never have that read as the stronger claim.
+func (r Receipt) Evidence() Evidence {
+	if r.evidence == EvidenceConsumerApplied {
+		return EvidenceConsumerApplied
+	}
+	return EvidenceTransportAccepted
+}
+
+// ReceiptFromMarker derives the evidence from what the consumer returned.
+//
+// The only constructor that can produce EvidenceConsumerApplied. Pass the value of
+// ApplicationReceiptHeader from the consumer's response; anything else, including an absent
+// header, yields transport evidence.
+func ReceiptFromMarker(marker string) Receipt {
+	if marker == ApplicationReceiptApplied {
+		return Receipt{evidence: EvidenceConsumerApplied}
+	}
+	return Receipt{evidence: EvidenceTransportAccepted}
+}
+
+// TransportReceipt states that something accepted the message and nothing more. What a broker
+// adapter returns, and the honest answer for any transport that cannot carry the consumer's
+// own assertion back.
+func TransportReceipt() Receipt {
+	return Receipt{evidence: EvidenceTransportAccepted}
 }
 
 // ErrPoison marks a publication failure that retrying cannot fix: an unregistered event

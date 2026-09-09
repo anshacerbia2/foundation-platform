@@ -115,10 +115,13 @@ TEMPORAL_TESTS = TestDeadLetteredAtNamesTheTransitionNotTheTransactionStart|Test
 DISPATCHER = outbox\dispatcher.go
 REPLAY_TESTS = TestADeadLetterRetainsWhatAReplayNeeds|TestADeadLetterCanBeReplayedAfterTheOriginalIsGone
 
-mutate: mutate-temporal mutate-replay
-	@echo Both mutations went red and both files were restored.
+DISPATCH = outbox\dispatch.go
+EVIDENCE_TESTS = TestNoMarkerRecordsTransportEvidenceOnly|TestAnUnrecognisedMarkerIsNotAppliedEvidence
 
-.PHONY: mutate-temporal mutate-replay
+mutate: mutate-temporal mutate-replay mutate-evidence
+	@echo All three mutations went red and every file was restored.
+
+.PHONY: mutate-temporal mutate-replay mutate-evidence
 
 mutate-temporal:
 	@if not exist .env (echo No .env yet. Run: make env && exit 1)
@@ -140,6 +143,18 @@ mutate-replay:
 	@go test ./outbox/ -run "$(REPLAY_TESTS)" -count=1 && (echo && echo The suite PASSED without the retention, so it does not test replay sufficiency. && copy $(DISPATCHER).orig $(DISPATCHER) >nul && del $(DISPATCHER).orig && exit 1) || echo Replay gates went red, as they must.
 	@copy $(DISPATCHER).orig $(DISPATCHER) >nul
 	@del $(DISPATCHER).orig
+
+# The third gate: applied evidence claimed without the consumer's marker. Resolution treats
+# that class as proof the consumer holds the event, so a publication that only reached a
+# broker must never produce it.
+mutate-evidence:
+	@if not exist .env (echo No .env yet. Run: make env && exit 1)
+	@copy $(DISPATCH) $(DISPATCH).orig >nul
+	@powershell -NoProfile -Command "$$p='$(DISPATCH)'; $$t=[IO.File]::ReadAllText($$p); $$n=$$t -replace 'if marker == ApplicationReceiptApplied \{','if true {'; if ($$n -eq $$t) { exit 3 }; [IO.File]::WriteAllText($$p,$$n)" || (echo The mutation found nothing to change -- this gate is silently passing and must be updated && copy $(DISPATCH).orig $(DISPATCH) >nul && del $(DISPATCH).orig && exit 1)
+	@echo Mutated: every publication now claims applied evidence. Both evidence gates must now fail.
+	@go test ./outbox/ -run "$(EVIDENCE_TESTS)" -count=1 && (echo && echo The suite PASSED while every publication claimed applied evidence, so it does not test the distinction. && copy $(DISPATCH).orig $(DISPATCH) >nul && del $(DISPATCH).orig && exit 1) || echo Evidence gates went red, as they must.
+	@copy $(DISPATCH).orig $(DISPATCH) >nul
+	@del $(DISPATCH).orig
 
 # ---------------------------------------------------------------------------
 # Gates

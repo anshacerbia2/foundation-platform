@@ -17,10 +17,18 @@ func (f transactionFunc) InTx(ctx context.Context, fn func(context.Context, db.T
 	return f(ctx, fn)
 }
 
+// publisherFunc adapts a plain function to Publisher.
+//
+// The function still returns only an error: these unit tests are about the dispatcher's
+// branching, not about evidence, and the receipt they establish is the transport class either
+// way. A test that cares which class is recorded needs a database to record it in.
 type publisherFunc func(context.Context, event.Envelope) error
 
-func (f publisherFunc) Publish(ctx context.Context, envelope event.Envelope) error {
-	return f(ctx, envelope)
+func (f publisherFunc) Publish(ctx context.Context, envelope event.Envelope) (Receipt, error) {
+	if err := f(ctx, envelope); err != nil {
+		return Receipt{}, err
+	}
+	return TransportReceipt(), nil
 }
 
 func dispatcherWithRows(t *testing.T, rows [][]any, publish publisherFunc) (*Dispatcher, *dbtest.Tx) {
@@ -61,8 +69,12 @@ func TestDispatchOnceClaimsPublishesAndMarksTheRow(t *testing.T) {
 	if published.StreamPosition != 42 {
 		t.Errorf("streamposition = %d, want 42", published.StreamPosition)
 	}
-	if len(tx.Calls()) != 2 {
-		t.Fatalf("calls = %d, want claim and mark", len(tx.Calls()))
+	// Claim, mark published, record the receipt. The receipt is written in the same
+	// transaction on purpose: a receipt for a delivery that rolled back would be evidence of
+	// something that did not happen, and a published row without one would be a delivery the
+	// resolution contract cannot see.
+	if len(tx.Calls()) != 3 {
+		t.Fatalf("calls = %d, want claim, mark and receipt", len(tx.Calls()))
 	}
 }
 
