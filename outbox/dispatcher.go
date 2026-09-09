@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,19 @@ type transactor interface {
 // Config configures a dispatcher. Each deployable supplies its own values; this module
 // reads no environment variable, and the composition root injects what it constructs.
 type Config struct {
+	// Consumer names the destination this dispatcher delivers to.
+	//
+	// Required, and it is identity rather than labelling: a delivery receipt is an answer
+	// about a delivery -- this event, to this consumer -- and platform.outbox's single
+	// `published` flag is exactly what cannot express that. A receipt written without a
+	// consumer would establish that an event was delivered somewhere, which resolves nothing.
+	//
+	// One dispatcher, one destination. A second destination is a second dispatcher with its
+	// own name, and the fan-out that would need -- one delivery row per (event, consumer) --
+	// is deliberately not built: the enforcement scope is one producer and one projection
+	// consumer, and organization-control refuses a second active one.
+	Consumer string
+
 	// Interval is the poll period. It sets a latency floor on accept-to-claim, which the
 	// revocation design budgets at 1 s, so it is a security-relevant setting rather than
 	// a tuning preference.
@@ -116,6 +130,13 @@ func NewDispatcher(pool *db.Pool, publisher Publisher, cfg Config) (*Dispatcher,
 	}
 	if publisher == nil {
 		return nil, errors.New("outbox: a publisher is required")
+	}
+	// Not defaulted. Every other field here has a defensible default; a consumer name does
+	// not, because the wrong one attributes a delivery receipt to a destination that never
+	// received the event, and a made-up one would satisfy the resolution predicate for a
+	// consumer that does not exist.
+	if strings.TrimSpace(cfg.Consumer) == "" {
+		return nil, errors.New("outbox: a consumer name is required; a delivery receipt without one establishes nothing")
 	}
 	cfg.applyDefaults()
 	return &Dispatcher{tx: pool, publisher: publisher, cfg: cfg, jitter: rand.Float64}, nil
@@ -271,12 +292,13 @@ func (d *Dispatcher) settle(ctx context.Context, tx db.Tx, row claimed) error {
 			fmt.Sprintf("stored envelope is not publishable: %v", err))
 	}
 
-	if err := d.publisher.Publish(ctx, envelope); err != nil {
+	receipt, err := d.publisher.Publish(ctx, envelope)
+	if err != nil {
 		class := classify(err)
 		return d.fail(ctx, tx, row, class, redact.String(err.Error()))
 	}
 
-	return d.markPublished(ctx, tx, row)
+	return d.markPublished(ctx, tx, row, receipt)
 }
 
 const markPublishedStatement = `UPDATE platform.outbox
@@ -284,9 +306,30 @@ SET published = TRUE, published_at = now(), last_error = NULL, failure_class = N
     next_attempt_at = NULL
 WHERE created_at = $1 AND event_id = $2`
 
-func (d *Dispatcher) markPublished(ctx context.Context, tx db.Tx, row claimed) error {
+// recordReceiptStatement records what this delivery established.
+//
+// Written in the same transaction as the row being marked published, so a receipt cannot
+// exist for a delivery that was rolled back and a published row cannot exist without its
+// receipt. The dead-letter resolution contract reads these to establish that a specific event
+// reached a specific consumer, and a receipt whose delivery never committed would be evidence
+// of something that did not happen.
+//
+// ON CONFLICT DO NOTHING because a replay of an event the consumer already applied is a
+// successful no-op at the consumer -- its inbox guard dedupes on the same key -- and the first
+// receipt already records what was established. Overwriting it with a later, possibly weaker
+// class would let a replay through a broker erase the evidence a direct delivery produced.
+const recordReceiptStatement = `INSERT INTO platform.delivery_receipt
+    (event_id, consumer, event_type, evidence)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (event_id, consumer) DO NOTHING`
+
+func (d *Dispatcher) markPublished(ctx context.Context, tx db.Tx, row claimed, receipt Receipt) error {
 	if _, err := tx.Exec(ctx, markPublishedStatement, row.createdAt, row.eventID); err != nil {
 		return fmt.Errorf("outbox: marking %s published: %w", row.eventID, err)
+	}
+	if _, err := tx.Exec(ctx, recordReceiptStatement,
+		row.eventID, d.cfg.Consumer, row.eventType, string(receipt.Evidence())); err != nil {
+		return fmt.Errorf("outbox: recording the receipt for %s: %w", row.eventID, err)
 	}
 	return nil
 }

@@ -14,21 +14,27 @@ import (
 )
 
 // fakePublisher records what it was asked to publish and fails on command.
+//
+// marker is what the consumer would have returned in ApplicationReceiptHeader. Empty by
+// default, so a test that does not care about evidence records transport evidence -- the weak
+// class. Defaulting to the strong one would make every test assert the property a receipt
+// exists to establish without any test having arranged it.
 type fakePublisher struct {
 	mu        sync.Mutex
 	published []event.Envelope
 	err       error
+	marker    string
 }
 
-func (f *fakePublisher) Publish(_ context.Context, e event.Envelope) error {
+func (f *fakePublisher) Publish(_ context.Context, e event.Envelope) (Receipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.err != nil {
-		return f.err
+		return Receipt{}, f.err
 	}
 	f.published = append(f.published, e)
-	return nil
+	return ReceiptFromMarker(f.marker), nil
 }
 
 func (f *fakePublisher) count() int {
@@ -113,6 +119,11 @@ func clearOutbox(ctx context.Context, t *testing.T, p *db.Pool) {
 func newTestDispatcher(t *testing.T, p *db.Pool, pub Publisher, cfg Config) *Dispatcher {
 	t.Helper()
 
+	// Consumer is required and never defaulted, so the helper supplies one. Tests that care
+	// which consumer a receipt names set it themselves.
+	if cfg.Consumer == "" {
+		cfg.Consumer = "test-consumer"
+	}
 	d, err := NewDispatcher(p, pub, cfg)
 	if err != nil {
 		t.Fatalf("NewDispatcher: %v", err)
@@ -515,17 +526,17 @@ type blockingPublisher struct {
 	count int
 }
 
-func (b *blockingPublisher) Publish(ctx context.Context, _ event.Envelope) error {
+func (b *blockingPublisher) Publish(ctx context.Context, _ event.Envelope) (Receipt, error) {
 	select {
 	case <-b.release:
 	case <-ctx.Done():
-		return ctx.Err()
+		return Receipt{}, ctx.Err()
 	}
 
 	b.mu.Lock()
 	b.count++
 	b.mu.Unlock()
-	return nil
+	return ReceiptFromMarker(ApplicationReceiptApplied), nil
 }
 
 func (b *blockingPublisher) publishedCount() int {
