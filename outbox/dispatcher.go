@@ -148,6 +148,28 @@ func NewDispatcher(pool *db.Pool, publisher Publisher, cfg Config) (*Dispatcher,
 // is the only way it ends: a publication failure is a row's problem and is recorded on
 // that row, not a reason to take the dispatcher down.
 func (d *Dispatcher) Run(ctx context.Context) error {
+	// The database contract, before any worker exists.
+	//
+	// The schema this dispatcher writes to is applied by a different repository on a different
+	// release cadence, and nothing links the two -- which has already produced one version skew
+	// where this module wrote to a table the consuming service had not deployed. Discovered per
+	// event, that failure is silent and endless: the receipt write shares a transaction with the
+	// row being marked published, so no row is ever marked published and every event retries
+	// forever against an error about a table nobody installed.
+	//
+	// Checked here rather than left to the caller because Run is the one function nobody can
+	// skip. CheckDispatcherPrerequisites is exported for readiness probes, and nothing depends
+	// on anyone remembering to call it.
+	// Cancellation first, because a cancelled context is not a contract failure and must not be
+	// reported as one. A shutdown that races startup would otherwise return "the database does
+	// not satisfy the dispatcher's contract" about a database that was never asked.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkPrerequisites(ctx, d.tx); err != nil {
+		return err
+	}
+
 	var wg sync.WaitGroup
 
 	start := func(priorityOnly bool, count int) {

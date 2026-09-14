@@ -229,3 +229,29 @@ type testingTB interface {
 	Helper()
 	Fatalf(format string, args ...any)
 }
+
+// ExecOutsideTransaction runs one statement on a connection of its own, with no transaction.
+//
+// It exists for the two statements PostgreSQL refuses inside a transaction block — CREATE DATABASE
+// and DROP DATABASE — which a test needs when it must build a database in a deliberately wrong
+// state: a migration set stopping short of a table, so a preflight's failing branch can be
+// provoked without touching the database every other test in the run depends on.
+//
+// db.Pool offers no non-transactional path, and should not: every statement the estate's code
+// issues belongs in a transaction. This is the exception, and it lives here because arch.json
+// confines the driver to db/ — a test elsewhere reaching for pgx directly is a boundary violation,
+// and archcheck says so.
+//
+// Test support only. Nothing in a deployable should call it.
+func ExecOutsideTransaction(ctx context.Context, dsn, statement string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("dbtest: connecting for %q: %w", statement, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	if _, err := conn.Exec(ctx, statement); err != nil {
+		return fmt.Errorf("dbtest: %q: %w", statement, err)
+	}
+	return nil
+}
