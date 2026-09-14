@@ -65,8 +65,16 @@ var dispatcherRequirements = []struct {
 	},
 	{
 		table:      "platform.delivery_receipt",
-		privileges: []string{"INSERT"},
-		because:    "recordReceiptStatement records what each delivery established",
+		privileges: []string{"INSERT", "SELECT"},
+		// SELECT for the same reason as dead_letter above, and it was listed as INSERT alone in
+		// v0.2.5 -- a preflight that would have passed while the statement it guards failed on the
+		// first delivery, which is the exact failure this check exists to prevent.
+		//
+		// The measurement was already in hand for dead_letter and simply not repeated here. That
+		// is the shape of mistake this file is meant to end, applied to one table and not the one
+		// beside it, so the requirement is now measured per table rather than inferred from its
+		// neighbour.
+		because: "recordReceiptStatement records what each delivery established, and its ON CONFLICT target requires SELECT",
 	},
 }
 
