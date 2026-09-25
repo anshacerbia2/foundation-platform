@@ -220,14 +220,39 @@ span.
 **Exit:** both consuming repositories build against a tagged version rather than a
 branch.
 
-`identity-control` now builds against `v0.2.1` rather than a branch, so half of this exit
-criterion is met. `organization-control` still holds designs and no Go module, so the other
-half closes when it takes its first commit rather than when anything further lands here.
+**Met.** Every consumer builds against a tag:
+
+| Consumer | Pins |
+| :-- | :-- |
+| `organization-control` | `v0.2.7` |
+| `foundation-reference` | `v0.2.6` |
+| `identity-control` | `v0.2.2` |
 
 Two tags followed `v0.1.0`. `v0.2.0` added `verify`; `v0.2.1` made the platform migration set
 re-runnable, which is the defect recorded under Environment findings above — the first
 deployment succeeded and every one after it aborted, and only a consumer running the pipeline
 twice could have found it.
+
+## Week 4 · Delivery evidence and dead-letter correctness
+
+Built for `organization-control`'s dead-letter resolution (`TDD-organization-control-005`),
+which closed on 2026-09-24. `TDD-001` is the current statement of each item.
+
+| Tag | Adds |
+| :-- | :-- |
+| `v0.2.3` | `dead_lettered_at` names the transition (`statement_timestamp()`); a dead letter retains `aggregate_id` and `priority`, so it can replay itself |
+| `v0.2.4` | `platform.delivery_receipt`, with typed evidence: `consumer_applied` only from the consumer's marker, else `transport_accepted` |
+| `v0.2.5` | Dispatcher preflight: the database contract is verified before any worker starts |
+| `v0.2.6` | Preflight requires `SELECT` beside `INSERT` on `delivery_receipt`, because `ON CONFLICT` needs it |
+| `v0.2.7` | The dead-letter resolution record: type, actor, and reference, all or nothing |
+
+Open, owned here:
+
+- **`platform.delivery_receipt` retention.** The table is unbounded, deliberately, until
+  deleting evidence is designed. It is backlog item 7 in `organization-control`'s ROADMAP.
+- **`first_failed_at` still takes `now()`.** It is off by at most one claim transaction.
+- **`migrations_test.go` does not list `delivery_receipt`** among the tables it checks.
+  `receipt_integration_test.go` covers the table itself.
 
 ## Decisions this repository does not make
 

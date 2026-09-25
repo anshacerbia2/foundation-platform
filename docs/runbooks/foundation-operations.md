@@ -10,9 +10,14 @@ system's `platform` schema from the other.
 2. Read only incident fields first: `event_id`, `event_type`, `failure_class`, attempts,
    and timestamps. Do not paste `payload` or `envelope` into tickets or chat
 3. Correct the schema, adapter, or downstream condition that made the event poison
-4. Replay through the owning system's broker adapter with the original `event_id`
-5. Confirm the consumer recorded `(event_id, consumer)` and the intended effect exists
-6. Set `resolved_at`; never delete the incident row manually
+4. Replay through the owning system's replay path with the original `event_id`, lowest
+   aggregate version first. The row carries `aggregate_id` and `priority`; a row where
+   either is null cannot be replayed, and neither value may be guessed
+5. Confirm a `platform.delivery_receipt` row exists for `(event_id, consumer)` with
+   `evidence = 'consumer_applied'`. `transport_accepted` does not prove the effect exists
+6. Resolve through the owning system's resolution path, which writes `resolved_at`,
+   `resolution_type`, `resolved_by`, and `resolution_reference` together. The database
+   refuses any of them alone. Never delete the incident row manually
 
 ## Dispatcher stall
 
