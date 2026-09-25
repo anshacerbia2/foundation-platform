@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.3.0
+  version: 1.4.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-08-14
+  last_reviewed: 2026-09-25
   parent_sad:
     - SAD-001
     - SAD-004
@@ -37,7 +37,10 @@ repository reimplements.
 **In scope**
 
 - The `platform.outbox` table, its partitioning, and its ordering guarantee.
-- The dispatcher: claim, publish, acknowledge, retry, and dead-letter behavior.
+- The dispatcher: claim, publish, acknowledge, retry, release, and dead-letter behavior, and
+  the database contract it verifies before starting.
+- The `platform.dead_letter` incident record, including what a replay and a resolution need.
+- The `platform.delivery_receipt` evidence record and the two evidence classes.
 - The CloudEvents 1.0 envelope and the Scnehaux event type naming rule.
 - The `platform.processed_event` deduplication table and the consumer guard.
 - The `platform.idempotency_key` claim and replay path.
@@ -48,9 +51,12 @@ repository reimplements.
 - Any domain concept. This module defines no Principal, Membership, Tenant, or
   Workspace type, and holds no domain state.
 - Which events exist and what they mean — owned by the publishing system's designs.
-- Broker product selection — fixed enterprise-wide by ADR-GLB-003 §5 and STD-GLB-004 §3,
-  and consumed here through the `Publisher` interface rather than a client.
+- Delivery substrate selection. ADR-GLB-016 chooses a delivery profile per contract, and this
+  module consumes it through the `Publisher` interface rather than a client.
 - The Keycloak projection applied on receipt — owned by the Identity Control designs.
+- Deciding whether a dead letter may be closed. This module stores the resolution record and
+  refuses an incomplete one. The rule for when a closure is justified belongs to the publishing
+  system (`TDD-organization-control-005`).
 
 ## Technical Context
 
@@ -73,9 +79,11 @@ than as guidance:
    `event_id`, three local retries with exponential backoff, and dead-letter routing.
    Its exception clause reads *None. All event-driven architecture rules apply
    unconditionally.*
-2. **ADR-GLB-003** fixes polling with `FOR UPDATE SKIP LOCKED` as the Stage 1
-   delivery mechanism and requires the outbox schema to leverage partitioning so
-   processed blocks are truncated in bulk rather than deleted row by row.
+2. **ADR-GLB-016** requires the publication intent to commit in the same local
+   transaction as the authoritative mutation. It is relayed by polling with
+   `FOR UPDATE SKIP LOCKED` from a partitioned table, so processed blocks are truncated
+   in bulk rather than deleted row by row. It also separates transport acceptance from
+   business completion, which is why this module records which one a delivery proved.
 3. **ADR-GLB-006** requires backward-compatible schema evolution, major version
    promotion inside the event type, and registration in the enterprise Schema
    Registry.
@@ -91,7 +99,7 @@ corrected.
 | Package | Responsibility |
 | :-- | :-- |
 | `id` | UUIDv7 generation, parsing, and ordering; the canonical identifier form |
-| `outbox` | Table access, dispatcher, lease management, retry and dead-letter routing |
+| `outbox` | Table access, dispatcher, retry, release and dead-letter routing, delivery receipts, the dispatcher's database preflight, dead-letter retention helpers |
 | `event` | CloudEvents envelope construction, type naming, schema version binding |
 | `inbox` | Deduplication guard over `platform.processed_event` |
 | `idempotency` | Idempotency key claim, conflict detection, stored-response replay |
@@ -110,7 +118,7 @@ sequenceDiagram
     participant T as Transaction manager
     participant O as platform.outbox
     participant P as Dispatcher
-    participant B as Broker
+    participant A as Publisher adapter
     participant C as Consumer
 
     D->>T: Begin
@@ -118,13 +126,18 @@ sequenceDiagram
     D->>O: Append envelope in the same transaction
     T->>T: Commit
     P->>O: Claim batch FOR UPDATE SKIP LOCKED
-    P->>B: Publish
-    B-->>P: Acknowledge
-    P->>O: Mark published
-    B->>C: Deliver
-    C->>C: Guard on processed_event
-    C->>C: Apply effect once
+    P->>A: Publish
+    A->>C: Deliver (HTTP, or a broker in between)
+    C->>C: Guard on processed_event and apply the effect, in one transaction
+    C-->>A: Acknowledge, with the application marker if applied
+    A-->>P: Receipt
+    P->>O: Mark published and write the delivery receipt, in the claim transaction
 ```
+
+The adapter is the host's. Today the only one is `foundation-reference`'s
+`dispatch.HTTPPublisher`, which is ADR-GLB-016's Direct Durable Delivery profile. A broker
+adapter would sit in the same place and change nothing here, except that a broker cannot carry
+the consumer's application marker, so every receipt it produced would be `transport_accepted`.
 
 The domain mutation and the outbox append share one transaction. A service that
 mutates state and publishes in two transactions is a defect, and the test suite
@@ -190,7 +203,7 @@ projection consumers compare against. It is publisher-local, may contain gaps af
 rollback, and is neither an entity identifier nor a broker offset. The prohibition on
 exposing sequential entity identifiers in STD-GLB-002 therefore does not apply to it.
 
-Partitioning is required by ADR-GLB-003 so processed blocks are truncated in bulk.
+Partitioning exists so processed blocks are truncated in bulk.
 The partition key appears in the primary key because PostgreSQL requires it. Daily
 partitions are created ahead of time by a scheduled job, and partitions whose rows
 are fully published and older than the retention window are dropped.
@@ -207,8 +220,8 @@ missing-future-partition threshold in §Operational Notes.
 primary key and its exception clause reads *None*. PostgreSQL requires the partition
 key in the primary key of a partitioned table, and a `UNIQUE (event_id)` constraint is
 unavailable for the same reason, so `event_id` alone is not enforced unique here. The
-two enterprise rules are in genuine tension, and partitioning wins because ADR-GLB-003
-requires it and the alternative is row-by-row deletion on a hot table.
+two enterprise rules are in genuine tension, and partitioning wins because the alternative
+is row-by-row deletion on a hot table.
 
 The deviation is contained rather than resolved. Consumers deduplicate against
 `platform.processed_event`, where `event_id` is part of an enforced unique key, so
@@ -247,35 +260,101 @@ which is the failure mode this key shape exists to prevent.
 
 ```sql
 CREATE TABLE platform.dead_letter (
-    event_id      UUID        PRIMARY KEY,
-    event_type    TEXT        NOT NULL,
-    envelope      JSONB       NOT NULL,
-    payload       JSONB       NOT NULL,
-    consumer      TEXT,
-    failure_class TEXT        NOT NULL,
-    failure_detail TEXT       NOT NULL,
-    attempts      INTEGER     NOT NULL,
-    first_failed_at TIMESTAMPTZ NOT NULL,
-    dead_lettered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at   TIMESTAMPTZ
+    event_id             UUID        PRIMARY KEY,
+    event_type           TEXT        NOT NULL,
+    envelope             JSONB,                -- nulled by disposal
+    payload              JSONB,                -- nulled by disposal
+    consumer             TEXT,                 -- not written by the dispatcher
+    failure_class        TEXT        NOT NULL,
+    failure_detail       TEXT        NOT NULL,
+    attempts             INTEGER     NOT NULL,
+    first_failed_at      TIMESTAMPTZ NOT NULL,
+    dead_lettered_at     TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    aggregate_id         UUID,                 -- what a replay re-appends under
+    priority             SMALLINT,             -- which lane a replay re-enters
+    resolved_at          TIMESTAMPTZ,
+    resolution_type      TEXT,
+    resolved_by          TEXT,
+    resolution_reference TEXT,
+    CONSTRAINT dead_letter_resolution_complete CHECK (
+        (resolved_at IS NULL AND resolution_type IS NULL
+            AND resolved_by IS NULL AND resolution_reference IS NULL)
+     OR (resolved_at IS NOT NULL AND btrim(resolution_type) <> ''
+            AND btrim(resolved_by) <> '' AND btrim(resolution_reference) <> ''))
 );
 ```
 
 A row here means an event was accepted by a domain transaction and never reached its
-consumer. For a priority event that is a containment failure, so the alert on this
-table is not a queue-depth alert.
+consumer. For a priority event that is a containment failure, so the alert on this table is
+not a queue-depth alert.
 
-`failure_class` is the field the dispatcher branches on, and only `poison` reaches this
-table from the priority lane. Retention is bounded because the retained `envelope` and
-`payload` carry restricted identity and organization context, and EAD-003 §5.4
-prohibits indefinite retention:
+`failure_class` is the field the dispatcher branches on, and only `poison` reaches this table
+from the priority lane.
 
-- A resolved row is disposed after `DEAD_LETTER_RETENTION` measured from `resolved_at`.
-- An unresolved row is never disposed. Its age is alerted at
-  `DEAD_LETTER_MAX_UNRESOLVED_AGE` so the table forces escalation rather than
-  accumulating undelivered security events.
-- Disposal removes `envelope` and `payload` and retains `event_id`, `event_type`,
-  `failure_class`, and timestamps, so the incident record survives the data it carried.
+**A row can replay itself.** `aggregate_id` and `priority` are retained with the envelope, so a
+replay is `outbox.Append(aggregate_id, envelope, Priority() when priority = 0)` from the row
+alone. Without them a replay depended on the original outbox partition, which retention
+removes, and the incident record would outlive the ability to act on it. Rows written before
+these columns existed were backfilled from the outbox where it still held them. The rest stay
+null, because a guessed `aggregate_id` names a real aggregate somewhere, and the replay would
+deliver the event under the wrong subject.
+
+**A closure is a record, not a timestamp.** `dead_letter_resolution_complete` refuses a
+`resolved_at` without a type, an actor, and a reference to the evidence, and it refuses blank
+values. Closing an incident without saying why is therefore impossible at the database, and
+reopening one means clearing all four together. Which closures are justified is the publishing
+system's rule, not this module's.
+
+**`dead_lettered_at` names the transition.** It defaults to `statement_timestamp()` rather than
+`now()`, so each row in a batch carries the moment it was dead-lettered, not the start of the
+claim transaction. `first_failed_at` is still stamped with `now()`, which is a known imprecision
+of at most one claim transaction.
+
+Retention is bounded because the retained `envelope` and `payload` carry restricted identity and
+organization context, and EAD-003 §5.4 prohibits indefinite retention:
+
+- A resolved row is disposed after a retention period measured from `resolved_at`.
+  `DisposeResolvedDeadLetters(tx, resolvedBefore)` nulls `envelope` and `payload`.
+- An unresolved row is never disposed. `CountStaleUnresolvedDeadLetters(tx, olderThan)` feeds
+  the alert, so the table forces escalation rather than accumulating undelivered security events.
+- Disposal keeps everything but the two payload columns: the incident, its replay coordinates,
+  and its resolution record. The fact of the failure, and of its closure, outlives the data it
+  carried.
+
+The host supplies both boundaries. This design's values are 90 days and 24 hours.
+
+### Delivery Receipt
+
+```sql
+CREATE TABLE platform.delivery_receipt (
+    event_id    UUID        NOT NULL,
+    consumer    TEXT        NOT NULL,
+    event_type  TEXT        NOT NULL,
+    evidence    TEXT        NOT NULL
+        CONSTRAINT delivery_receipt_evidence_check
+        CHECK (evidence IN ('consumer_applied', 'transport_accepted')),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    PRIMARY KEY (event_id, consumer)
+);
+```
+
+One row per successful delivery to a named consumer, written in the same transaction that marks
+the outbox row published. A failed publication writes none. The row says what the delivery
+proved:
+
+| Evidence | Meaning | Produced by |
+| :-- | :-- | :-- |
+| `consumer_applied` | The consumer committed the effect before acknowledging | Only `ReceiptFromMarker("applied")`, from the consumer's `X-Application-Receipt: applied` |
+| `transport_accepted` | The transport took it, and nothing more is known | Everything else: no marker, an unrecognised marker, a broker |
+
+The first receipt wins (`ON CONFLICT (event_id, consumer) DO NOTHING`), so a replay cannot weaken
+evidence already recorded. `consumer` is `Config.Consumer`: the consumer's identity, not its
+endpoint. An endpoint moves, and the question the receipt answers is whether this consumer holds
+this event.
+
+This is the table a dead-letter resolution trusts, and it is why the strong class is reachable
+only through the consumer's marker. Retention is not yet bounded. That is recorded as debt,
+because deleting evidence before any resolution that might need it is its own design decision.
 
 ### Idempotency
 
@@ -382,6 +461,26 @@ func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope
 
 // Priority marks an event for the reserved dispatch lane.
 func Priority() Option
+
+// Publisher is the host's delivery adapter. Wrapping ErrPoison marks a permanent refusal;
+// any other error is unavailability.
+type Publisher interface {
+    Publish(ctx context.Context, e event.Envelope) (Receipt, error)
+}
+
+// Receipt carries the evidence class; its field is unexported, so the class is set only
+// by these constructors.
+func ReceiptFromMarker(marker string) Receipt // consumer_applied only for "applied"
+func TransportReceipt() Receipt               // always transport_accepted
+
+// NewDispatcher refuses a Config without a Consumer. Run verifies the database contract
+// before any worker starts.
+func NewDispatcher(pool *db.Pool, publisher Publisher, cfg Config) (*Dispatcher, error)
+func CheckDispatcherPrerequisites(ctx context.Context, pool *db.Pool) error
+
+// Retention helpers; the host supplies the boundaries.
+func DisposeResolvedDeadLetters(ctx context.Context, tx db.Tx, resolvedBefore time.Time) (int64, error)
+func CountStaleUnresolvedDeadLetters(ctx context.Context, tx db.Tx, olderThan time.Time) (int64, error)
 ```
 
 Two details of this signature were settled during implementation and are recorded here
@@ -436,54 +535,71 @@ No secret, token, credential, or unrestricted personal data appears in any field
 ### Dispatch
 
 ```text
+before any worker starts:
+    verify USAGE on platform, the three tables exist, and this role holds
+    outbox SELECT+UPDATE, dead_letter INSERT+SELECT, delivery_receipt INSERT+SELECT
+    any gap -> ErrPrerequisite, and no worker starts
+
 claim:
     SELECT ... FROM platform.outbox
     WHERE published = FALSE
+      AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+      AND (:any_lane OR priority = :lane)
     ORDER BY priority ASC, sequence ASC
     LIMIT :batch
     FOR UPDATE SKIP LOCKED
 
 for each claimed row:
-    publish to broker
-    on acknowledgement:
+    an envelope that will not decode, disagrees with its sequence, or fails
+    validation is poison without being published
+
+    publish through the Publisher
+    on success:
         published = TRUE, published_at = now()
+        INSERT delivery_receipt (event_id, Config.Consumer, evidence) ON CONFLICT DO NOTHING
     on failure:
-        classify: poison, or unavailable
-        attempts = attempts + 1, record last_error and failure_class
+        class := poison if the error wraps ErrPoison, else unavailable
+        attempts := attempts + 1          -- counted across claims, never reset
+        record last_error (redacted) and failure_class
 
-        if failure_class = poison:
-            -- invalid envelope, unserializable payload, unregistered type.
-            -- retrying cannot help, so no attempts are spent on it.
-            move to platform.dead_letter, mark published to stop redelivery
-            raise the dead-letter alert
+        decide:
+            poison                               -> dead-letter
+            attempts < MaxAttempts               -> retry after backoff
+            priority = 0                         -> release after escalating backoff
+            otherwise                            -> dead-letter
 
-        else if attempts >= OUTBOX_MAX_ATTEMPTS:
-            if priority = 0:
-                reset attempts, release to the unpublished pool
-                escalate the claim backoff, raise the undelivered-priority alert
-            else:
-                move to platform.dead_letter, mark published
-                raise the dead-letter alert
-
-        else:
-            release for retry after backoff
+        dead-letter: copy to platform.dead_letter, mark published to stop redelivery
+        retry, release: next_attempt_at := now() + backoff
 ```
 
-Priority `0` carries security events and `100` carries lifecycle events. Two workers
-are reserved for the priority lane so a lifecycle backlog cannot delay a revocation.
+| Class | Priority | attempts < MaxAttempts | attempts ≥ MaxAttempts |
+| :-- | :-- | :-- | :-- |
+| poison | any | dead-letter | dead-letter |
+| unavailable | `0` (security) | retry | **release, never dead-letter** |
+| unavailable | `100` (lifecycle) | retry | dead-letter |
 
-Retry uses exponential backoff with jitter, bounded at three local attempts per claim
-as STD-GLB-004 requires. Empty polls back off so an idle dispatcher does not wake the
-database on a fixed interval.
+Priority `0` carries security events and `100` carries lifecycle events. Two workers are
+reserved for the priority lane so a lifecycle backlog cannot delay a revocation.
+
+Retry uses exponential backoff with equal jitter, from `BackoffBase` doubling per attempt up to
+`BackoffMax`, over the three local attempts STD-GLB-004 requires. Each claim is one attempt, and
+the count accumulates across claims. Empty polls back off up to `IdleInterval`, so an idle
+dispatcher does not wake the database on a fixed interval.
 
 **Why a priority event is never dead-lettered for unavailability.** Dead-lettering is a
 mechanism for poison messages: three attempts then abandon is calibrated for an event
 that will never succeed. A broker outage is not that. Applying the poison rule to an
 outage discards a revocation that would have published a minute later, and the
 publisher cannot compensate — `organization-control` holds no Keycloak credential and
-cannot enforce the change itself. So a priority event exhausts its three local attempts
-per claim and then returns to the pool with escalating claim backoff, which honours the
-standard's local-retry bound without abandoning the event.
+cannot enforce the change itself. So a priority event that exhausts its three local attempts
+returns to the pool with escalating backoff, which honours the standard's local-retry bound
+without abandoning the event.
+
+The attempt count is kept on release rather than reset. What protects a priority row from being
+abandoned is the decision rule, not the size of the number: `decide` returns *release* for a
+priority row at any count, so the row can never reach dead-letter through unavailability.
+Keeping the count lets the backoff grow toward `BackoffMax` instead of oscillating, and leaves an
+operator able to see what an outage has cost.
 
 **What bounds enforcement while the broker is down.** Not delivery. Each consumer
 declares `max_accepted_age` and a `stale_behavior`, and a projection that exceeds its
@@ -496,19 +612,6 @@ It is genuinely unbounded, it is a containment failure, and §Operational Notes 
 it at any occurrence with no threshold.
 
 Replicas contend safely because `SKIP LOCKED` lets each claim a disjoint batch.
-
-**Departure recorded: a released priority row does not reset its attempt count.** The
-pseudocode above says `reset attempts, release to the unpublished pool, escalate the claim
-backoff`. The first and third clauses contradict each other — a counter that resets cannot
-escalate, and the backoff is derived from it.
-
-The implementation keeps the count. Nothing is lost, because what protects a priority row
-from being abandoned is the classification rule and not the size of the number: the
-decision function returns *release* for a priority row at any attempt count, so it can
-never reach dead-letter through unavailability. Keeping the count lets the delay grow
-toward `OUTBOX_PRIORITY_CLAIM_BACKOFF_MAX` instead of oscillating, and leaves an operator
-able to see what an outage has cost. A test asserts the row survives several hundred
-consecutive failures without being dead-lettered.
 
 **Claim, publish, and settle share one transaction**, so the row lock *is* the lease.
 Another worker cannot take a row that is mid-publication, and a crashed dispatcher
@@ -543,23 +646,29 @@ check runs against the committed history. The location changes; the rule does no
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| :-- | :-- | :-- |
-| `OUTBOX_DISPATCH_INTERVAL` | `500ms` | Poll interval, matching the ADR-GLB-003 Stage 1 target |
-| `OUTBOX_BATCH_SIZE` | `100` | Rows claimed per cycle |
-| `OUTBOX_WORKERS` | `4` | Standard-lane workers |
-| `OUTBOX_PRIORITY_WORKERS` | `2` | Workers reserved for priority `0` |
-| `OUTBOX_MAX_ATTEMPTS` | `3` | Local retries per claim, per STD-GLB-004 |
-| `OUTBOX_PRIORITY_CLAIM_BACKOFF_MAX` | `30s` | Ceiling on claim backoff for a repeatedly failing priority row |
-| `DEAD_LETTER_RETENTION` | `90d` | Age from `resolved_at` after which `envelope` and `payload` are removed |
-| `DEAD_LETTER_MAX_UNRESOLVED_AGE` | `24h` | Age at which an unresolved row is alerted; unresolved rows are never disposed |
-| `OUTBOX_BACKOFF_BASE` | `250ms` | Exponential backoff base with jitter |
-| `OUTBOX_PARTITION_AHEAD` | `7d` | Days of partitions pre-created |
-| `OUTBOX_RETENTION` | `30d` | Age after which fully published partitions are dropped |
-| `BROKER_URL` | none, required | Broker endpoint, credentials scoped per deployable |
+The module reads no environment variable. Each deployable's composition root builds
+`outbox.Config` and injects it:
 
-Each consuming system supplies its own values. The module reads no configuration
-directly; the composition root of each deployable constructs and injects it.
+| Field | Default | Purpose |
+| :-- | :-- | :-- |
+| `Consumer` | none, required | The consumer identity delivery receipts are keyed by |
+| `Interval` | `500ms` | Poll interval, the Stage 1 polling target |
+| `IdleInterval` | `5s` | Ceiling of the empty-poll backoff |
+| `BatchSize` | `100` | Rows claimed per cycle |
+| `Workers` | `4` | Standard-lane workers |
+| `PriorityWorkers` | `2` | Workers reserved for priority `0` |
+| `MaxAttempts` | `3` | Local attempts before dead-letter or release, per STD-GLB-004 |
+| `BackoffBase` | `250ms` | Exponential backoff base, with jitter |
+| `BackoffMax` | `30s` | Ceiling on backoff, including a repeatedly released priority row |
+
+The host also supplies the maintenance boundaries. This design's values are:
+
+| Boundary | Value | Purpose |
+| :-- | :-- | :-- |
+| Dead-letter retention | `90d` from `resolved_at` | After it, `envelope` and `payload` are removed |
+| Unresolved dead-letter alert | `24h` | Unresolved rows are alerted, never disposed |
+| Partitions ahead | `7d` | Days of partitions pre-created |
+| Outbox retention | `30d` | Fully published partitions older than this are dropped |
 
 ## Testing Strategy
 
@@ -575,14 +684,33 @@ directly; the composition root of each deployable constructs and injects it.
 - A backlog of ten thousand priority-`100` rows does not delay a priority-`0` event
   beyond its budget.
 - Two dispatcher replicas produce no duplicated publication and no starved row.
-- Three consecutive publication failures classified `poison` move the row to
-  `platform.dead_letter` with its failure class, attempt count, and first-failure
-  timestamp.
-- A **priority** row failing repeatedly with `unavailable` is never dead-lettered: it
-  returns to the unpublished pool, its claim backoff escalates to the configured
-  ceiling, and it publishes once the broker recovers.
-- A **poison** classification dead-letters immediately without consuming retries.
+- A **poison** classification dead-letters on the first failure, with its failure class,
+  attempt count, and first-failure timestamp.
+- A **standard** row failing with `unavailable` is dead-lettered once its attempts are spent.
+- A **priority** row failing repeatedly with `unavailable` is never dead-lettered. The decision
+  function is asserted over 499 consecutive failures, and a database-backed row over 10: it
+  returns to the pool, its backoff escalates to the ceiling, and it publishes once the consumer
+  recovers.
 - Backoff intervals grow exponentially and carry jitter.
+
+### Evidence and Preflight
+
+- The consumer's marker records `consumer_applied`. No marker, an unrecognised marker, or an
+  unset receipt records `transport_accepted`.
+- A failed publication leaves no receipt, and a replay does not weaken an existing one.
+- The database refuses an undefined evidence class, and a dispatcher without a consumer is
+  refused at construction.
+- A dispatcher missing a required table or privilege refuses to start. One whose contract is met
+  starts.
+
+### Dead-Letter Record
+
+- A dead letter retains what a replay needs, and can be replayed after the original partition is
+  gone.
+- The backfill recovers what the outbox still holds and leaves the rest null.
+- `dead_lettered_at` names each row's own transition, not the transaction start.
+- A timestamp alone cannot close an incident. Partial and blank resolutions are refused, and
+  reopening must clear the whole record.
 
 ### Deduplication
 
@@ -592,10 +720,9 @@ directly; the composition root of each deployable constructs and injects it.
 - Two logical consumers in one deployable processing the same `event_id` each record
   their own `processed_event` row and each apply their effect exactly once. This is the
   case the composite key exists for, and a single-column key fails it.
-- A resolved dead-letter row past `DEAD_LETTER_RETENTION` loses `envelope` and
-  `payload` and retains its incident fields.
-- An unresolved dead-letter row past `DEAD_LETTER_MAX_UNRESOLVED_AGE` is alerted and
-  is not disposed.
+- A resolved dead-letter row past its retention boundary loses `envelope` and `payload` and
+  retains its incident fields.
+- An unresolved dead-letter row past the alert boundary is counted and is not disposed.
 
 ### Envelope
 
@@ -637,9 +764,14 @@ returns the row to the pool instead, and it is escalated as a containment failur
 rather than triaged as a delivery error.
 
 Retained `envelope` and `payload` in `platform.dead_letter` are the most sensitive
-slice this module holds and sit in its least-observed table. Disposal after
-`DEAD_LETTER_RETENTION` removes the payload and keeps the incident record, so the fact
-of the failure outlives the data it carried.
+slice this module holds and sit in its least-observed table. Disposal after the retention
+boundary removes the payload and keeps the incident record, so the fact of the failure
+outlives the data it carried.
+
+`platform.delivery_receipt` is evidence, and evidence a writer can edit is not evidence. The
+dispatcher's role needs `INSERT` and `SELECT` on it (the latter because `ON CONFLICT` requires
+it), and no role needs `UPDATE` or `DELETE`. Each host grants accordingly; `organization-control`
+does and asserts it.
 
 ## Performance Notes
 
@@ -648,7 +780,7 @@ indexed partial scan per poll, bounded by batch size, against an index that only
 covers unpublished rows and therefore stays small regardless of history.
 
 Partition drops replace row-by-row deletion, which is what keeps autovacuum churn off
-the hot table as ADR-GLB-003 requires.
+the hot table.
 
 The 500 ms poll interval sets a latency floor. Accept-to-claim is measured against the
 1 s budget the revocation design allocates, and the floor consumes half of it, which
@@ -662,8 +794,11 @@ is why the interval is a security-relevant setting rather than a tuning preferen
 | Oldest unpublished standard row | 5 min | 15 min |
 | Dead-letter rows, priority events | any occurrence | any occurrence |
 | Dead-letter rows, lifecycle events | any occurrence | 10 in an hour |
-| Dispatcher lease age | 2 cycles | 10 cycles |
+| Unresolved dead letter age | 24 h | 24 h, priority events |
 | Missing future partition | 2 days ahead | 1 day ahead |
+
+There is no lease signal, because there is no lease column: the claim transaction's row lock is
+the lease, and a crashed dispatcher releases its rows at once.
 
 Every metric, span, and log line carries `deployable` and `system` so load and failure
 are attributable per consuming system while both run the same code.
@@ -678,7 +813,7 @@ investigation.
 | :-- | :-- |
 | Parent system | SAD-001 — Scnehaux Identity Runtime |
 | Parent system | SAD-004 — Scnehaux Organization Control |
-| Governed by | ADR-GLB-003 — Transactional Outbox, Stage 1 polling and partitioning, and the Kafka protocol as the broker |
+| Governed by | ADR-GLB-016 — source-local outbox, delivery profiles, transport acceptance distinct from business completion |
 | Governed by | ADR-GLB-006 — Event Versioning and Schema Evolution |
 | Conforms to | STD-GLB-004 — CloudEvents envelope, deduplication, retry and dead-letter |
 | Conforms to | STD-GLB-001 — RFC 7807 problem details |
@@ -686,34 +821,26 @@ investigation.
 | Enterprise constraint | EAD-004 — commands, facts, and outcomes are distinct; mutations are duplicate-safe |
 | Enterprise constraint | EAD-003 — private domain persistence; no cross-domain database access |
 | Consumed by | Identity Control designs, for Keycloak projection and session removal |
-| Consumed by | Organization Control designs, for membership authority and revocation |
+| Consumed by | Organization Control designs, for membership authority, revocation, and dead-letter resolution (`TDD-organization-control-005`) |
 
-### Broker Product, Settled
+### Delivery Profiles
 
-`ADR-GLB-003 §5` and `STD-GLB-004 §3` now fix the **Kafka protocol** for every
-asynchronous event in the enterprise. What that decision means for this module:
+ADR-GLB-016 selects a delivery profile per contract rather than one broker for the enterprise.
+What that means for this module:
 
-- The `Publisher` interface is unchanged. The adapter satisfying it lives in each
-  consuming system, and this module still holds no broker client.
-- The reserved priority lane is a **separate topic** with its own consumer group and
-  partition allocation, not a priority field inside one topic. `priority = 0` selects
-  the topic; the column keeps its meaning as the dispatch-lane selector inside the
-  outbox.
-- Producers partition by `aggregate_id`. Kafka preserves order only within a partition,
-  and `sequence` is publisher-global, so per-aggregate ordering is the guarantee the
-  broker actually provides. This design already tolerates cross-aggregate reordering —
-  consumers reconcile by authority version and deduplicate on `event_id` — so nothing
-  in the ordering section changes. An adapter partitioning on any other key would
-  remove the per-aggregate guarantee while every test here continued to pass.
-- `contracts/events` and `tools/schemacheck` remain the interim registry. STD-GLB-004
-  now names a Kafka-ecosystem schema registry as the target and permits this repository
-  to hold schemas in source control provided the compatibility check runs in CI, which
-  it does. The interim state is recorded as debt in `ROADMAP.md`.
-
-### Open Questions
-
-1. Whether the **producer relay** dead-letter held in `platform.dead_letter` remains a
-   local table or is replaced by a broker queue once the broker is selected. It covers
-   outbox-to-broker publication only; consumer execution retry and DLQ ownership remain
-   with each consuming adapter. The local table survives a broker outage, so it is
-   retained until evidence justifies removing it.
+- **The `Publisher` interface is the seam.** The adapter satisfying it lives in each host, and
+  this module holds no broker client. Membership security events currently use Direct Durable
+  Delivery over HTTP (`foundation-reference`'s `dispatch.HTTPPublisher`).
+- **The dead letter stays local.** `platform.dead_letter` covers outbox-to-consumer publication.
+  It survives a broker outage, and it is the incident record dead-letter resolution is built on,
+  so it stays whichever profile a contract uses.
+- **The stream profile adds three constraints**, if a contract ever takes it:
+  - The priority lane becomes a separate topic, selected by `priority = 0`, rather than a field
+    inside one topic.
+  - Producers partition by `aggregate_id`, because a log preserves order only within a
+    partition. Consumers already tolerate cross-aggregate reordering, since they reconcile by
+    authority version and deduplicate on `event_id`.
+  - Receipts degrade to `transport_accepted`, because a broker cannot carry the consumer's
+    application marker.
+- **Schemas.** `contracts/events` and `tools/schemacheck` are the interim schema registry, with
+  the compatibility check running in CI. The interim state is recorded as debt in `ROADMAP.md`.

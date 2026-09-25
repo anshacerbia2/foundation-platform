@@ -148,8 +148,9 @@ const (
 	// so it stops being redelivered.
 	dispositionDeadLetter
 
-	// dispositionRelease returns a priority row to the unpublished pool with its attempts
-	// reset, so it keeps trying for as long as the outage lasts.
+	// dispositionRelease returns a priority row to the unpublished pool, keeping its attempt
+	// count so the backoff keeps escalating, and it keeps trying for as long as the outage
+	// lasts. decide never dead-letters a priority row for unavailability at any count.
 	dispositionRelease
 )
 
