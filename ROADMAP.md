@@ -245,14 +245,15 @@ which closed on 2026-09-24. `TDD-001` is the current statement of each item.
 | `v0.2.5` | Dispatcher preflight: the database contract is verified before any worker starts |
 | `v0.2.6` | Preflight requires `SELECT` beside `INSERT` on `delivery_receipt`, because `ON CONFLICT` needs it |
 | `v0.2.7` | The dead-letter resolution record: type, actor, and reference, all or nothing |
+| `v0.2.8` | Delivery-receipt retention: `PruneDeliveryReceipts` and `ReceiptReference` |
 
 Open, owned here:
 
-- **`platform.delivery_receipt` retention.** The table is unbounded, deliberately, until
-  deleting evidence is designed. It is backlog item 7 in `organization-control`'s ROADMAP.
+- ✅ **`platform.delivery_receipt` retention**, `v0.2.8`. `PruneDeliveryReceipts` deletes a receipt
+  past the boundary only while no incident is open and only when no closure cites it;
+  `ReceiptReference` is the citation form it protects (TDD-001 §Delivery Receipt). The host
+  runs it: `organization-control`'s backlog item 7.
 - **`first_failed_at` still takes `now()`.** It is off by at most one claim transaction.
-- **`migrations_test.go` does not list `delivery_receipt`** among the tables it checks.
-  `receipt_integration_test.go` covers the table itself.
 
 ## Decisions this repository does not make
 

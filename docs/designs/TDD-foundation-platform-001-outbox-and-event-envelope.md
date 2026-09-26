@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.4.0
+  version: 1.5.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-09-25
+  last_reviewed: 2026-09-27
   parent_sad:
     - SAD-001
     - SAD-004
@@ -353,8 +353,28 @@ endpoint. An endpoint moves, and the question the receipt answers is whether thi
 this event.
 
 This is the table a dead-letter resolution trusts, and it is why the strong class is reachable
-only through the consumer's marker. Retention is not yet bounded. That is recorded as debt,
-because deleting evidence before any resolution that might need it is its own design decision.
+only through the consumer's marker.
+
+**Retention.** A receipt is evidence that a closure was, or could be, justified. So deleting one
+is bounded by what could still need it, not only by age. `PruneDeliveryReceipts(tx,
+recordedBefore)` deletes a receipt only when all three conditions hold:
+
+- **It is past the boundary.** A younger receipt is kept, so a resolution in progress finds it.
+- **No dead letter is unresolved.** While any incident is open, nothing is pruned. Which receipt
+  could close an incident is the publishing system's rule, not this module's. `REPLAYED` reads
+  the event's own receipt, but `SUPERSEDED` reads a receipt for a different event, which this
+  module cannot identify. So the only generic answer is to keep every receipt until the debt is
+  closed.
+- **No closure cites it.** A receipt named in a closure's `resolution_reference` is kept
+  permanently, because the closure record is permanent. Disposal removes a dead letter's payload
+  and never its resolution, and a resolution citing a receipt that no longer exists explains
+  nothing.
+
+The citation is recognised by its exact form, `platform.delivery_receipt:<event_id>:<consumer>`,
+which names this module's table and key. `ReceiptReference(eventID, consumer)` builds it, and
+hosts build the string there rather than restating it. A host writing the reference another way
+keeps its closures but loses the protection. Pruning runs as the migration role. No runtime role
+holds `DELETE` on evidence.
 
 ### Idempotency
 
@@ -481,6 +501,10 @@ func CheckDispatcherPrerequisites(ctx context.Context, pool *db.Pool) error
 // Retention helpers; the host supplies the boundaries.
 func DisposeResolvedDeadLetters(ctx context.Context, tx db.Tx, resolvedBefore time.Time) (int64, error)
 func CountStaleUnresolvedDeadLetters(ctx context.Context, tx db.Tx, olderThan time.Time) (int64, error)
+func PruneDeliveryReceipts(ctx context.Context, tx db.Tx, recordedBefore time.Time) (int64, error)
+
+// The resolution_reference form a closure uses to cite a receipt, and the form pruning protects.
+func ReceiptReference(eventID, consumer string) string
 ```
 
 Two details of this signature were settled during implementation and are recorded here
@@ -667,6 +691,7 @@ The host also supplies the maintenance boundaries. This design's values are:
 | :-- | :-- | :-- |
 | Dead-letter retention | `90d` from `resolved_at` | After it, `envelope` and `payload` are removed |
 | Unresolved dead-letter alert | `24h` | Unresolved rows are alerted, never disposed |
+| Delivery-receipt retention | `90d` from `recorded_at` | After it, a receipt no closure cites is deleted, and only while no incident is open |
 | Partitions ahead | `7d` | Days of partitions pre-created |
 | Outbox retention | `30d` | Fully published partitions older than this are dropped |
 
@@ -702,6 +727,10 @@ The host also supplies the maintenance boundaries. This design's values are:
   refused at construction.
 - A dispatcher missing a required table or privilege refuses to start. One whose contract is met
   starts.
+- A receipt past retention that nothing cites is pruned, and one inside retention is kept. A
+  receipt a closure cites is never pruned. Nothing is pruned while an incident is open. A mutation
+  removing either the citation clause or the open-incident clause turns its test red; both were
+  observed.
 
 ### Dead-Letter Record
 
@@ -770,8 +799,9 @@ outlives the data it carried.
 
 `platform.delivery_receipt` is evidence, and evidence a writer can edit is not evidence. The
 dispatcher's role needs `INSERT` and `SELECT` on it (the latter because `ON CONFLICT` requires
-it), and no role needs `UPDATE` or `DELETE`. Each host grants accordingly; `organization-control`
-does and asserts it.
+it), and no runtime role needs `UPDATE` or `DELETE`. Each host grants accordingly;
+`organization-control` does and asserts it. Retention deletes under the migration role, which owns
+the table, and never a receipt a closure cites.
 
 ## Performance Notes
 

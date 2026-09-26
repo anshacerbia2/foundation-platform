@@ -89,6 +89,7 @@ func TestPlatformSchemaDeclaresTheTablesTheLibraryQueries(t *testing.T) {
 		"platform.processed_event",
 		"platform.dead_letter",
 		"platform.idempotency_key",
+		"platform.delivery_receipt",
 		"platform.outbox_sequence",
 	} {
 		if !strings.Contains(all, table) {
