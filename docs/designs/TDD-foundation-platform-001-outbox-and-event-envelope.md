@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.5.0
+  version: 1.6.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -276,11 +276,19 @@ CREATE TABLE platform.dead_letter (
     resolution_type      TEXT,
     resolved_by          TEXT,
     resolution_reference TEXT,
+    waived_at            TIMESTAMPTZ,          -- a waiver, never a closure
+    waived_until         TIMESTAMPTZ,
+    waived_by            TEXT,
+    waiver_reason        TEXT,
     CONSTRAINT dead_letter_resolution_complete CHECK (
         (resolved_at IS NULL AND resolution_type IS NULL
             AND resolved_by IS NULL AND resolution_reference IS NULL)
      OR (resolved_at IS NOT NULL AND btrim(resolution_type) <> ''
-            AND btrim(resolved_by) <> '' AND btrim(resolution_reference) <> ''))
+            AND btrim(resolved_by) <> '' AND btrim(resolution_reference) <> '')),
+    CONSTRAINT dead_letter_waiver_complete CHECK (
+        (waived_at IS NULL AND waived_until IS NULL AND waived_by IS NULL AND waiver_reason IS NULL)
+     OR (waived_at IS NOT NULL AND waived_until > waived_at
+            AND btrim(waived_by) <> '' AND btrim(waiver_reason) <> ''))
 );
 ```
 
@@ -312,6 +320,23 @@ values. Closing an incident without saying why is therefore impossible at the da
 reopening one means clearing all four together. Which closures are justified is the publishing
 system's rule, not this module's.
 
+**A waiver is not a closure.** Some incidents have no corrective path, for example when the
+consumer that refused the event has been decommissioned. The only sanctioned act used to be a
+closure, and a closure says the authority the event carried reached the consumer. So a waiver has
+its own four columns (v0.2.9) and never touches the resolution columns: a host reading debt from
+`resolved_at` keeps reading it there, and a waiver cannot make an incident look delivered.
+
+A waiver changes only three operational things:
+
+- the stale alert, which it silences until `waived_until`;
+- disposal, which may remove its payload after retention;
+- receipt pruning, which it no longer holds.
+
+`dead_letter_waiver_complete` requires an author, a reason and an expiry later than the waiver
+itself. Once a waiver expires, the alert fires again, so a forgotten exception becomes a question
+rather than a blind spot. Which incidents may be waived, for how long and by whom is the
+publishing system's rule.
+
 **`dead_lettered_at` names the transition.** It defaults to `statement_timestamp()` rather than
 `now()`, so each row in a batch carries the moment it was dead-lettered, not the start of the
 claim transaction. `first_failed_at` is still stamped with `now()`, which is a known imprecision
@@ -320,10 +345,14 @@ of at most one claim transaction.
 Retention is bounded because the retained `envelope` and `payload` carry restricted identity and
 organization context, and EAD-003 §5.4 prohibits indefinite retention:
 
-- A resolved row is disposed after a retention period measured from `resolved_at`.
-  `DisposeResolvedDeadLetters(tx, resolvedBefore)` nulls `envelope` and `payload`.
-- An unresolved row is never disposed. `CountStaleUnresolvedDeadLetters(tx, olderThan)` feeds
-  the alert, so the table forces escalation rather than accumulating undelivered security events.
+- A resolved row is disposed after a retention period measured from `resolved_at`, and a waived
+  row after the same period measured from `waived_at`. `DisposeResolvedDeadLetters(tx,
+  resolvedBefore)` nulls `envelope` and `payload`. A waiver means no replay will be made, so the
+  payload serves nothing. An expired waiver does not restart the clock: expiry reopens the
+  question for the alert, not for retention.
+- An unresolved row that is not waived is never disposed. `CountStaleUnresolvedDeadLetters(tx,
+  olderThan)` feeds the alert, leaving out rows under an unexpired waiver, so the table forces
+  escalation rather than accumulating undelivered security events.
 - Disposal keeps everything but the two payload columns: the incident, its replay coordinates,
   and its resolution record. The fact of the failure, and of its closure, outlives the data it
   carried.
@@ -371,7 +400,8 @@ recordedBefore)` deletes a receipt only when all three conditions hold:
   could close an incident is the publishing system's rule, not this module's. `REPLAYED` reads
   the event's own receipt, but `SUPERSEDED` reads a receipt for a different event, which this
   module cannot identify. So the only generic answer is to keep every receipt until the debt is
-  closed.
+  closed. A row under an unexpired waiver does not count here. The waiver says no receipt will
+  close it, and one waived incident would otherwise suspend retention for as long as it stands.
 - **No closure cites it.** A receipt named in a closure's `resolution_reference` is kept
   permanently, because the closure record is permanent. Disposal removes a dead letter's payload
   and never its resolution, and a resolution citing a receipt that no longer exists explains
@@ -735,6 +765,10 @@ The host also supplies the maintenance boundaries. This design's values are:
 - A dispatcher missing a required table or privilege refuses to start. One whose contract is met
   starts.
 - A dead letter names the consumer that refused it.
+- The schema refuses a waiver without an author, a reason, or an expiry after it began. An
+  unexpired waiver silences the stale alert and an expired one does not; a waived payload is
+  disposed after retention while the incident and waiver stay; a waived incident does not hold
+  receipt pruning, and an unwaived one still does.
 - A receipt past retention that nothing cites is pruned, and one inside retention is kept. A
   receipt a closure cites is never pruned. Nothing is pruned while an incident is open. A mutation
   removing either the citation clause or the open-incident clause turns its test red; both were

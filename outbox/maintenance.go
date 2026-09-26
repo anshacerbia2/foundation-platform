@@ -9,14 +9,18 @@ import (
 	"github.com/anshacerbia2/foundation-platform/db"
 )
 
+// A waived row's payload is disposable too. A waiver says the incident has no corrective path, so
+// the payload no longer serves a replay, and EAD-003 §5.4 forbids keeping restricted data
+// indefinitely. Measured from waived_at, and kept whether or not the waiver has since expired: an
+// expiry reopens the question for the alert, not the retention clock.
 const disposeDeadLettersStatement = `UPDATE platform.dead_letter
 SET envelope = NULL, payload = NULL
-WHERE resolved_at IS NOT NULL
-  AND resolved_at <= $1
+WHERE ((resolved_at IS NOT NULL AND resolved_at <= $1)
+    OR (waived_at IS NOT NULL AND waived_at <= $1))
   AND (envelope IS NOT NULL OR payload IS NOT NULL)`
 
 // DisposeResolvedDeadLetters removes retained event data after the configured retention
-// boundary while preserving the incident record.
+// boundary while preserving the incident record. It covers resolved rows and waived ones.
 func DisposeResolvedDeadLetters(ctx context.Context, tx db.Tx, resolvedBefore time.Time) (int64, error) {
 	if db.IsNilTx(tx) {
 		return 0, ErrNoTransaction
@@ -31,11 +35,14 @@ func DisposeResolvedDeadLetters(ctx context.Context, tx db.Tx, resolvedBefore ti
 	return tag.RowsAffected(), nil
 }
 
+// A row under an unexpired waiver does not alert; a waiver past waived_until does, again.
 const countStaleDeadLettersStatement = `SELECT count(*)
 FROM platform.dead_letter
-WHERE resolved_at IS NULL AND dead_lettered_at <= $1`
+WHERE resolved_at IS NULL AND dead_lettered_at <= $1
+  AND NOT (waived_until IS NOT NULL AND waived_until > now())`
 
-// CountStaleUnresolvedDeadLetters returns the unresolved incidents old enough to alert.
+// CountStaleUnresolvedDeadLetters returns the unresolved incidents old enough to alert, leaving out
+// those under an unexpired waiver.
 func CountStaleUnresolvedDeadLetters(ctx context.Context, tx db.Tx, olderThan time.Time) (int64, error) {
 	if db.IsNilTx(tx) {
 		return 0, ErrNoTransaction
@@ -69,14 +76,18 @@ func ReceiptReference(eventID, consumer string) string {
 //   - Any open incident. While one dead letter is unresolved, nothing is pruned. Which receipt
 //     could close it is the publishing system's rule, not this module's -- REPLAYED reads the
 //     event's own receipt, and SUPERSEDED reads a receipt for a different event this module cannot
-//     identify -- so the only generic answer is to keep all of them until the debt is closed.
+//     identify -- so the only generic answer is to keep all of them until the debt is closed. A row
+//     under an unexpired waiver does not hold pruning: a waiver says no receipt will close it, and
+//     otherwise one waived incident would suspend retention for as long as it stands.
 //   - Citation. A receipt a closure names in resolution_reference is kept permanently, because the
 //     closure record is: disposal removes a dead letter's payload and never its resolution, and a
 //     resolution citing a receipt that no longer exists explains nothing.
 const pruneReceiptsStatement = `DELETE FROM platform.delivery_receipt r
 WHERE r.recorded_at <= $1
   AND NOT EXISTS (
-        SELECT 1 FROM platform.dead_letter d WHERE d.resolved_at IS NULL)
+        SELECT 1 FROM platform.dead_letter d
+         WHERE d.resolved_at IS NULL
+           AND NOT (d.waived_until IS NOT NULL AND d.waived_until > now()))
   AND NOT EXISTS (
         SELECT 1 FROM platform.dead_letter d
          WHERE d.resolution_reference = 'platform.delivery_receipt:' || r.event_id::text || ':' || r.consumer)`
