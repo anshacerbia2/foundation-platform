@@ -247,6 +247,7 @@ which closed on 2026-09-24. `TDD-001` is the current statement of each item.
 | `v0.2.7` | The dead-letter resolution record: type, actor, and reference, all or nothing |
 | `v0.2.8` | Delivery-receipt retention: `PruneDeliveryReceipts` and `ReceiptReference`. A dead letter names the consumer that refused it |
 | `v0.2.9` | Dead-letter waivers (`0007`): who, why and until when, kept apart from the closure. A waiver silences the stale alert until it expires, permits payload disposal, and does not hold receipt pruning |
+| `v0.2.10` | The outbox lease (`0008`): a short transaction leases a batch, publication happens outside any transaction, and each outcome commits alone, fenced on the lease. Preflight requires the lease columns. `LeaseDuration`, default 30 s, is also how long a crashed dispatcher's rows wait |
 
 Open, owned here:
 
@@ -254,19 +255,19 @@ Open, owned here:
   past the boundary only while no incident is open and only when no closure cites it;
   `ReceiptReference` is the citation form it protects (TDD-001 §Delivery Receipt). The host
   runs it: `organization-control`'s backlog item 7.
-- **`first_failed_at` still takes `now()`.** It is off by at most one claim transaction.
-- **The dispatcher holds a database transaction across each delivery.** `dispatchOnce` claims a
-  batch of up to `BatchSize` rows and publishes every one of them over HTTP inside the same
-  transaction, holding the claimed rows' locks and a pooled connection for as long as the
-  slowest consumer takes to answer, up to the publisher's timeout for each row. A slow or
-  hanging consumer therefore stretches one transaction across the whole batch: vacuum is held
-  back, the pool shrinks by one connection for the duration, and a crash mid-batch rolls back
-  outcomes already recorded for rows delivered successfully, which are then delivered again. It
-  is correct -- consumers deduplicate on `(event_id, consumer)` -- and it is the reason it was not
-  changed during P0. The fix is a lease: claim and mark rows in one short transaction, publish
-  outside any transaction, and record each outcome in its own. That changes the claim contract
-  and the preflight, so it is a design change of this module, not a patch. Recorded P1 in
-  RESPONSE-15, RESPONSE-16 and RESPONSE-17; tracked as `organization-control` backlog item 11.
+- ✅ **`first_failed_at` measured from the failure**, `v0.2.10`. It still takes `now()`, but
+  `now()` is now the start of the outcome's own transaction, which begins after the publication
+  returned, rather than the start of the claim. Recorded P1 in RESPONSE-16 and RESPONSE-17.
+- ✅ **The dispatcher no longer holds a transaction across each delivery**, `v0.2.10`.
+  - A short transaction leases the batch.
+  - Publication happens outside any transaction.
+  - Each outcome commits in its own transaction, fenced on the lease.
+  - A crash therefore loses at most the outcome being written.
+  - The price: a crashed dispatcher's rows wait up to `LeaseDuration` rather than being released
+    at once.
+
+  TDD-001 §Dispatch covers the full design. Recorded P1 in RESPONSE-15, RESPONSE-16 and
+  RESPONSE-17. `organization-control` backlog item 11.
 
 ## Decisions this repository does not make
 

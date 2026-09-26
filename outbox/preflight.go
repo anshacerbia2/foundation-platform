@@ -48,12 +48,16 @@ var ErrPrerequisite = errors.New("outbox: the database does not satisfy the disp
 var dispatcherRequirements = []struct {
 	table      string
 	privileges []string
-	because    string
+	// columns are ones added after the table was created. A table-level grant covers them, but
+	// a database whose migrations stop short of them fails every claim.
+	columns []string
+	because string
 }{
 	{
 		table:      "platform.outbox",
 		privileges: []string{"SELECT", "UPDATE"},
-		because:    "claimStatement reads the batch; markPublished and recordFailure write the outcome back",
+		columns:    []string{"lease_id", "leased_until"},
+		because:    "claimStatement leases the batch; markPublished and recordFailure write the outcome back",
 	},
 	{
 		table:      "platform.dead_letter",
@@ -129,6 +133,21 @@ func checkPrerequisites(ctx context.Context, tx transactor) error {
 					"%s does not exist; the foundation-platform migrations for this version have not been applied (%s)",
 					required.table, required.because))
 				continue
+			}
+
+			for _, column := range required.columns {
+				var exists bool
+				if err := tx.QueryRow(ctx,
+					`SELECT EXISTS (SELECT 1 FROM pg_attribute
+					  WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped)`,
+					required.table, column).Scan(&exists); err != nil {
+					return err
+				}
+				if !exists {
+					problems = append(problems, fmt.Sprintf(
+						"%s.%s does not exist; the foundation-platform migrations for this version have not been applied (%s)",
+						required.table, column, required.because))
+				}
 			}
 
 			for _, privilege := range required.privileges {

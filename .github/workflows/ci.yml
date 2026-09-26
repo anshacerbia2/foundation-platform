@@ -136,17 +136,18 @@ jobs:
             mv "$file.orig" "$file"
             exit 1
           fi
-          # Two tests rather than one. They fail for different reasons with the defect
-          # restored -- one that the timestamp precedes the publish attempt, one that a
-          # whole batch shares a single instant -- so running only the first would let a
-          # future change satisfy it while breaking the other.
+          # The test writes dead letters inside one transaction, directly. The dispatcher's own
+          # temporal tests no longer discriminate: since the lease, each outcome commits in a
+          # transaction that begins after the publication, so they hold with either default.
+          # The test asserts both halves of the defect: the value predates an instant read
+          # earlier in the transaction, and two rows share one instant.
           if go test ./outbox -count=1 \
-              -run 'TestDeadLetteredAtNamesTheTransitionNotTheTransactionStart|TestEachDeadLetterInABatchCarriesItsOwnTransition'; then
+              -run 'TestTheDeadLetterDefaultIsTheStatementNotTheTransaction'; then
             echo "::error::the suite passed with DEFAULT now() restored, so it does not test the temporal boundary"
             mv "$file.orig" "$file"
             exit 1
           fi
-          echo "the temporal boundary is load-bearing: restoring now() fails both temporal tests"
+          echo "the temporal boundary is load-bearing: restoring now() fails the default test"
           mv "$file.orig" "$file"
 
       # A dead letter must be replayable from its own row.
@@ -212,6 +213,35 @@ jobs:
           fi
           echo "the marker is load-bearing: mapping every publication to applied evidence fails both tests"
           mv "$file.orig" "$file"
+
+      # The lease replaced the claim transaction's row lock, so two predicates now carry what
+      # the lock used to: the claim skips a row whose lease is live, and an outcome is written
+      # only by the worker holding the lease. Without the first, a second worker publishes a
+      # row already in flight. Without the second, a worker whose lease expired dead-letters
+      # a row another worker is delivering.
+      - name: the lease is load-bearing
+        run: |
+          file=outbox/dispatcher.go
+          mutate() {
+            cp "$file" "$file.orig"
+            sed -i -E "$1" "$file"
+            if git diff --quiet "$file"; then
+              echo "::error::$2 was not found; this check is silently passing and must be updated"
+              mv "$file.orig" "$file"
+              exit 1
+            fi
+            if go test ./outbox -count=1 -run "$3"; then
+              echo "::error::the suite passed without $2, so it does not test the lease"
+              mv "$file.orig" "$file"
+              exit 1
+            fi
+            echo "$2 is load-bearing"
+            mv "$file.orig" "$file"
+          }
+          mutate 's/AND \(leased_until IS NULL OR leased_until <= now\(\)\)//' \
+            "the claim's lease predicate" 'TestALeasedRowIsSkippedByOtherWorkers'
+          mutate 's/AND lease_id = \$6::uuid //' \
+            "the dead-letter lease fence" 'TestAnOutcomeFromATakenOverLeaseIsDiscarded'
 
       # STD-GLB-BE-001 rules 3, 4, 7, and 12, asserted against the package graph rather
       # than against text, so an import introduced through an alias, a blank identifier,

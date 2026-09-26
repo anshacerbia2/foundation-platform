@@ -191,6 +191,55 @@ func TestEachDeadLetterInABatchCarriesItsOwnTransition(t *testing.T) {
 	}
 }
 
+// The column default itself, with no dispatcher in between.
+//
+// The two tests above describe the dispatcher, and since the lease each outcome commits in a
+// transaction of its own that begins after the publication returns: they hold with either
+// default. The default still matters to any writer that dead-letters inside a longer
+// transaction, so this is the test the CI mutation gate runs. It opens a transaction, lets time
+// pass, reads the clock, and only then inserts: with now() the row predates the probe, and two
+// inserts in the same transaction share one instant.
+func TestTheDeadLetterDefaultIsTheStatementNotTheTransaction(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	clearOutbox(ctx, t, p)
+
+	const insert = `INSERT INTO platform.dead_letter
+	    (event_id, event_type, envelope, payload, failure_class, failure_detail, attempts, first_failed_at)
+	VALUES (gen_random_uuid(), 'com.scnehaux.test.temporal.failed', '{}'::jsonb, '{}'::jsonb,
+	        'poison', 'refused', 1, clock_timestamp())
+	RETURNING dead_lettered_at`
+
+	var probe, first, second time.Time
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_sleep(0.05)"); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&probe); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, insert).Scan(&first); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "SELECT pg_sleep(0.01)"); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, insert).Scan(&second)
+	}); err != nil {
+		t.Fatalf("dead-lettering inside one transaction: %v", err)
+	}
+
+	if first.Before(probe) {
+		t.Errorf("dead_lettered_at = %s precedes %s, an instant read earlier in the same transaction; "+
+			"the default records the transaction's start, not the transition. "+
+			"See migrations/platform/0003_dead_letter_temporal_boundary.sql.",
+			first.UTC().Format(time.RFC3339Nano), probe.UTC().Format(time.RFC3339Nano))
+	}
+	if first.Equal(second) {
+		t.Errorf("two dead letters written 10ms apart both carry %s", first.UTC().Format(time.RFC3339Nano))
+	}
+}
+
 type slowPoisonPublisher struct {
 	delay time.Duration
 	err   error
