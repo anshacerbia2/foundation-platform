@@ -245,7 +245,7 @@ which closed on 2026-09-24. `TDD-001` is the current statement of each item.
 | `v0.2.5` | Dispatcher preflight: the database contract is verified before any worker starts |
 | `v0.2.6` | Preflight requires `SELECT` beside `INSERT` on `delivery_receipt`, because `ON CONFLICT` needs it |
 | `v0.2.7` | The dead-letter resolution record: type, actor, and reference, all or nothing |
-| `v0.2.8` | Delivery-receipt retention: `PruneDeliveryReceipts` and `ReceiptReference` |
+| `v0.2.8` | Delivery-receipt retention: `PruneDeliveryReceipts` and `ReceiptReference`. A dead letter names the consumer that refused it |
 
 Open, owned here:
 

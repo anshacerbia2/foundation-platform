@@ -175,6 +175,36 @@ func TestAFailedPublicationLeavesNoReceipt(t *testing.T) {
 	}
 }
 
+// A dead letter names the consumer that refused it.
+//
+// The column existed from the first migration and nothing wrote it, so a host could not tell whose
+// projection a poison event left behind and had to charge one consumer's refusal to every consumer.
+// Written, a host can attribute the debt to the consumer it belongs to.
+func TestADeadLetterNamesTheConsumerThatRefusedIt(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	clearOutbox(ctx, t, p)
+
+	e, _ := appendOne(ctx, t, p)
+	pub := &fakePublisher{err: fmt.Errorf("refused: %w", ErrPoison)}
+	d := newTestDispatcher(t, p, pub, Config{Consumer: "reference-projection"})
+	if _, err := d.dispatchOnce(ctx, false); err != nil {
+		t.Fatalf("dispatchOnce: %v", err)
+	}
+
+	var consumer *string
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return tx.QueryRow(ctx, `SELECT consumer FROM platform.dead_letter WHERE event_id = $1`,
+			e.ID.String()).Scan(&consumer)
+	}); err != nil {
+		t.Fatalf("reading the dead letter: %v", err)
+	}
+	if consumer == nil || *consumer != "reference-projection" {
+		t.Errorf("the dead letter names consumer %v, want %q; nobody can tell whose debt it is",
+			consumer, "reference-projection")
+	}
+}
+
 // A replay of an event the consumer already applied is a successful no-op at the consumer,
 // and the first receipt already records what was established. Overwriting it with a later,
 // weaker class would let a replay through a broker erase the evidence a direct delivery
