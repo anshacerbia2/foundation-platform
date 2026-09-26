@@ -255,6 +255,18 @@ Open, owned here:
   `ReceiptReference` is the citation form it protects (TDD-001 §Delivery Receipt). The host
   runs it: `organization-control`'s backlog item 7.
 - **`first_failed_at` still takes `now()`.** It is off by at most one claim transaction.
+- **The dispatcher holds a database transaction across each delivery.** `dispatchOnce` claims a
+  batch of up to `BatchSize` rows and publishes every one of them over HTTP inside the same
+  transaction, holding the claimed rows' locks and a pooled connection for as long as the
+  slowest consumer takes to answer, up to the publisher's timeout for each row. A slow or
+  hanging consumer therefore stretches one transaction across the whole batch: vacuum is held
+  back, the pool shrinks by one connection for the duration, and a crash mid-batch rolls back
+  outcomes already recorded for rows delivered successfully, which are then delivered again. It
+  is correct -- consumers deduplicate on `(event_id, consumer)` -- and it is the reason it was not
+  changed during P0. The fix is a lease: claim and mark rows in one short transaction, publish
+  outside any transaction, and record each outcome in its own. That changes the claim contract
+  and the preflight, so it is a design change of this module, not a patch. Recorded P1 in
+  RESPONSE-15, RESPONSE-16 and RESPONSE-17; tracked as `organization-control` backlog item 11.
 
 ## Decisions this repository does not make
 
