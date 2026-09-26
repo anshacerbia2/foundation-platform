@@ -40,8 +40,11 @@ func dispatcherWithRows(t *testing.T, rows [][]any, publish publisherFunc) (*Dis
 	return &Dispatcher{
 		tx:        transactor,
 		publisher: publish,
-		cfg:       Config{BatchSize: 10, MaxAttempts: 3, BackoffBase: time.Millisecond, BackoffMax: time.Second},
-		jitter:    func() float64 { return 0 },
+		// Built directly rather than through NewDispatcher, so no default is applied. A zero
+		// LeaseDuration would put the lease's deadline at the claim itself.
+		cfg: Config{BatchSize: 10, MaxAttempts: 3, BackoffBase: time.Millisecond, BackoffMax: time.Second,
+			LeaseDuration: time.Minute},
+		jitter: func() float64 { return 0 },
 	}, tx
 }
 
@@ -70,7 +73,7 @@ func TestDispatchOnceClaimsPublishesAndMarksTheRow(t *testing.T) {
 		t.Errorf("streamposition = %d, want 42", published.StreamPosition)
 	}
 	// Claim, mark published, record the receipt. The receipt is written in the same
-	// transaction on purpose: a receipt for a delivery that rolled back would be evidence of
+	// transaction as the mark on purpose: a receipt for a delivery that rolled back would be evidence of
 	// something that did not happen, and a published row without one would be a delivery the
 	// resolution contract cannot see.
 	if len(tx.Calls()) != 3 {

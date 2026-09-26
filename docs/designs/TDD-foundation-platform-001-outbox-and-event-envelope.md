@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.6.0
+  version: 1.7.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -125,13 +125,13 @@ sequenceDiagram
     T->>D: Apply domain mutation
     D->>O: Append envelope in the same transaction
     T->>T: Commit
-    P->>O: Claim batch FOR UPDATE SKIP LOCKED
-    P->>A: Publish
+    P->>O: Lease a batch (short transaction, SKIP LOCKED)
+    P->>A: Publish, outside any transaction
     A->>C: Deliver (HTTP, or a broker in between)
     C->>C: Guard on processed_event and apply the effect, in one transaction
     C-->>A: Acknowledge, with the application marker if applied
     A-->>P: Receipt
-    P->>O: Mark published and write the delivery receipt, in the claim transaction
+    P->>O: Mark published and write the delivery receipt, in the outcome's own transaction, fenced on the lease
 ```
 
 The adapter is the host's. Today the only one is `foundation-reference`'s
@@ -165,8 +165,11 @@ CREATE TABLE platform.outbox (
     failure_class   TEXT,
     first_failed_at TIMESTAMPTZ,
     next_attempt_at TIMESTAMPTZ,
+    lease_id     UUID,
+    leased_until TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (created_at, event_id)
+    PRIMARY KEY (created_at, event_id),
+    CONSTRAINT outbox_lease_complete CHECK ((lease_id IS NULL) = (leased_until IS NULL))
 ) PARTITION BY RANGE (created_at);
 
 CREATE INDEX outbox_unpublished
@@ -184,8 +187,14 @@ writes to.
 
 `next_attempt_at` is the earliest a failed row may be claimed again. STD-GLB-004 mandates
 exponential backoff, and without this column the only way to express a delay is for the
-worker to sleep — which would hold the claimed row's lock for the duration and turn a
-delay for one event into a stall for its whole batch.
+worker to sleep while holding the row, which would turn a delay for one event into a stall for
+its whole batch.
+
+`lease_id` and `leased_until` are the claim (`0008`). A worker that claims a row stamps it with
+its claim's identifier and an expiry; no other worker claims the row until the expiry passes,
+and an outcome is written only where `lease_id` still matches. Both or neither, because a lease
+without an expiry would hold a row forever and an expiry without an identifier could not be
+fenced. §Dispatch gives the reason the lease replaced a row lock.
 
 `first_failed_at` records when a row first failed to publish. `platform.dead_letter`
 requires it `NOT NULL`, and by the time a row is dead-lettered its first failure is
@@ -375,7 +384,8 @@ CREATE TABLE platform.delivery_receipt (
 ```
 
 One row per successful delivery to a named consumer, written in the same transaction that marks
-the outbox row published. A failed publication writes none. The row says what the delivery
+the outbox row published, and only when that worker still holds the row's lease. A failed
+publication writes none. The row says what the delivery
 proved:
 
 | Evidence | Meaning | Produced by |
@@ -597,24 +607,37 @@ No secret, token, credential, or unrestricted personal data appears in any field
 
 ```text
 before any worker starts:
-    verify USAGE on platform, the three tables exist, and this role holds
+    verify USAGE on platform, the three tables exist, platform.outbox has the lease
+    columns, and this role holds
     outbox SELECT+UPDATE, dead_letter INSERT+SELECT, delivery_receipt INSERT+SELECT
     any gap -> ErrPrerequisite, and no worker starts
 
-claim:
-    SELECT ... FROM platform.outbox
-    WHERE published = FALSE
-      AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-      AND (:any_lane OR priority = :lane)
-    ORDER BY priority ASC, sequence ASC
-    LIMIT :batch
-    FOR UPDATE SKIP LOCKED
+claim, in one short transaction:
+    lease := a new UUID
+    UPDATE platform.outbox SET lease_id = lease, leased_until = now() + LeaseDuration
+    WHERE the row is one of
+        SELECT ... FROM platform.outbox
+        WHERE published = FALSE
+          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+          AND (leased_until IS NULL OR leased_until <= now())
+          AND (:any_lane OR priority = :lane)
+        ORDER BY priority ASC, sequence ASC
+        LIMIT :batch
+        FOR UPDATE SKIP LOCKED
+    COMMIT
 
-for each claimed row:
+for each claimed row, in priority then sequence order, outside any transaction:
+    past the lease's local deadline -> stop; the rest are claimable again
+
     an envelope that will not decode, disagrees with its sequence, or fails
     validation is poison without being published
 
     publish through the Publisher
+    cut short by shutdown -> release this row and the rest, count no attempt, stop
+
+    each outcome in its own transaction, every write fenced on
+    lease_id = lease AND published = FALSE, which also clears the lease;
+    a fence matching no row rolls back and the outcome is discarded:
     on success:
         published = TRUE, published_at = now()
         INSERT delivery_receipt (event_id, Config.Consumer, evidence) ON CONFLICT DO NOTHING
@@ -629,7 +652,7 @@ for each claimed row:
             priority = 0                         -> release after escalating backoff
             otherwise                            -> dead-letter
 
-        dead-letter: copy to platform.dead_letter, mark published to stop redelivery
+        dead-letter: mark published to stop redelivery, then copy to platform.dead_letter
         retry, release: next_attempt_at := now() + backoff
 ```
 
@@ -674,13 +697,46 @@ it at any occurrence with no threshold.
 
 Replicas contend safely because `SKIP LOCKED` lets each claim a disjoint batch.
 
-**Claim, publish, and settle share one transaction**, so the row lock *is* the lease.
-Another worker cannot take a row that is mid-publication, and a crashed dispatcher
-releases its rows immediately rather than leaving them claimed until a lease expires. The
-cost is that broker latency is spent holding locks, which `SKIP LOCKED` makes survivable:
-a second worker steps over the locked rows rather than queueing behind them. If publish
-latency ever approaches the claim budget, the alternative is a lease column and settlement
-in a second transaction, which trades the recovery property away for shorter locks.
+**A lease, not a lock, holds a row in flight.** The claim is one short transaction, publication
+happens outside any transaction, and each outcome commits in a transaction of its own.
+
+The first design shared one transaction across claim, publish, and settle, so the row lock was
+the lease. That transaction stayed open while every row in the batch was published, up to the
+publisher's timeout for each. One slow consumer therefore:
+
+- held back vacuum;
+- kept a pooled connection busy for the whole batch;
+- on a crash mid-batch, rolled back the outcomes already recorded, so rows that had been
+  delivered were delivered again.
+
+Recorded P1 in RESPONSE-15 to RESPONSE-17. Under the lease a crash loses at most the outcome
+being written.
+
+**The fence.** Every outcome write matches `lease_id = lease AND published = FALSE`. A worker
+whose lease expired while it waited on the consumer, and whose row another worker then
+claimed, matches nothing: its transaction rolls back, and it records no attempt, no incident,
+and no receipt. The row's current holder records its own outcome. The dead-letter path marks
+the row first and inserts the incident second, so the fence decides before an incident exists.
+
+**What the lease costs.** A dispatcher that crashes leaves its rows leased until `leased_until`
+passes. The lock used to release them at once. With the default `LeaseDuration` of 30 s, a
+revocation claimed by a worker that then crashes waits up to 30 s, and the "oldest unpublished
+priority row" warning fires. What still bounds enforcement meanwhile is the consumer's staleness
+policy, as for an outage. A graceful shutdown releases the unpublished rows at once and counts
+no attempt, because a publication cut short by shutdown says nothing about the consumer.
+
+An outcome is written on a context that shutdown does not cancel, bounded at 10 s. A consumer
+that answered "applied" has applied the event, and that answer is the receipt a resolution may
+rest on.
+
+`LeaseDuration` must exceed the time to publish a whole batch. Otherwise the tail of a slow
+batch is claimed again and published twice. Consumers deduplicate, so that costs work and not
+correctness. The worker also stops publishing once its own clock passes the lease, so it does
+not race the worker that claimed the rest.
+
+Because each outcome's transaction begins after the publication returns, `now()` in that
+transaction is the time of the outcome and not of the claim. `first_failed_at`,
+`next_attempt_at` and `published_at` are therefore measured from the event they describe.
 
 ### Consumption
 
@@ -721,6 +777,7 @@ The module reads no environment variable. Each deployable's composition root bui
 | `MaxAttempts` | `3` | Local attempts before dead-letter or release, per STD-GLB-004 |
 | `BackoffBase` | `250ms` | Exponential backoff base, with jitter |
 | `BackoffMax` | `30s` | Ceiling on backoff, including a repeatedly released priority row |
+| `LeaseDuration` | `30s` | How long a claimed row is held before another worker may claim it. Also how long a crashed dispatcher's rows wait |
 
 The host also supplies the maintenance boundaries. This design's values are:
 
@@ -746,6 +803,14 @@ The host also supplies the maintenance boundaries. This design's values are:
 - A backlog of ten thousand priority-`100` rows does not delay a priority-`0` event
   beyond its budget.
 - Two dispatcher replicas produce no duplicated publication and no starved row.
+- While a publication is in flight, no lock is held on its row and the row carries a live lease.
+  Another worker claims nothing while the lease is live; a CI mutation removing the lease
+  predicate from the claim turns this red.
+- An outcome from a lease another worker took over records nothing: no incident, no attempt,
+  no receipt. A CI mutation removing the fence from the dead-letter path turns this red.
+- Each outcome commits before the next row in the batch is published.
+- Shutdown releases the unpublished rows at once and counts no attempt, and an "applied"
+  answer that arrives as shutdown begins is still recorded with its receipt.
 - A **poison** classification dead-letters on the first failure, with its failure class,
   attempt count, and first-failure timestamp.
 - A **standard** row failing with `unavailable` is dead-lettered once its attempts are spent.
@@ -762,8 +827,8 @@ The host also supplies the maintenance boundaries. This design's values are:
 - A failed publication leaves no receipt, and a replay does not weaken an existing one.
 - The database refuses an undefined evidence class, and a dispatcher without a consumer is
   refused at construction.
-- A dispatcher missing a required table or privilege refuses to start. One whose contract is met
-  starts.
+- A dispatcher missing a required table, the lease columns, or a privilege refuses to start. One
+  whose contract is met starts.
 - A dead letter names the consumer that refused it.
 - The schema refuses a waiver without an author, a reason, or an expiry after it began. An
   unexpired waiver silences the stale alert and an expired one does not; a waived payload is
@@ -779,7 +844,10 @@ The host also supplies the maintenance boundaries. This design's values are:
 - A dead letter retains what a replay needs, and can be replayed after the original partition is
   gone.
 - The backfill recovers what the outbox still holds and leaves the rest null.
-- `dead_lettered_at` names each row's own transition, not the transaction start.
+- `dead_lettered_at` names each row's own transition, not the transaction start. The column
+  default is tested directly, with two dead letters written inside one transaction, and a CI
+  mutation restoring `now()` turns that test red. The dispatcher's own temporal tests no longer
+  discriminate, because each outcome now commits in a transaction of its own.
 - A timestamp alone cannot close an incident. Partial and blank resolutions are refused, and
   reopening must clear the whole record.
 
@@ -869,8 +937,9 @@ is why the interval is a security-relevant setting rather than a tuning preferen
 | Unresolved dead letter age | 24 h | 24 h, priority events |
 | Missing future partition | 2 days ahead | 1 day ahead |
 
-There is no lease signal, because there is no lease column: the claim transaction's row lock is
-the lease, and a crashed dispatcher releases its rows at once.
+A crashed dispatcher leaves its rows leased for up to `LeaseDuration`. The oldest-unpublished
+signals above see that as ordinary lag and need no separate lease signal. A row whose lease
+keeps expiring without an outcome shows as the same lag.
 
 Every metric, span, and log line carries `deployable` and `system` so load and failure
 are attributable per consuming system while both run the same code.

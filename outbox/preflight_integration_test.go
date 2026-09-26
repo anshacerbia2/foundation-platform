@@ -47,42 +47,12 @@ func adminDSN(t *testing.T) string {
 // other test in this package reads, and removing a table from underneath them would produce
 // failures with nothing to do with what they assert.
 func TestRunRefusesWhenARequiredTableIsMissing(t *testing.T) {
-	admin := requireDatabase(t)
+	requireDatabase(t)
 	ctx := boundedContext(t)
 
-	// CREATE DATABASE cannot run inside a transaction block, and db.Pool exposes no path that is
-	// not one — deliberately, since every statement this module issues belongs in a transaction.
-	// A lone pgx connection is the exception, and it is confined to these two statements.
-	name := fmt.Sprintf("platform_preflight_%d", time.Now().UnixNano())
-	outsideTx(t, ctx, "CREATE DATABASE "+name)
-	t.Cleanup(func() {
-		outsideTx(t, context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	})
-	_ = admin
-
-	behind, err := db.Open(ctx, db.Config{Name: "preflight-behind", DSN: replaceDatabase(adminDSN(t), name), MaxConns: 2})
-	if err != nil {
-		t.Fatalf("opening the throwaway database: %v", err)
-	}
-	t.Cleanup(behind.Close)
-
-	// Every migration except the one that adds the table the current dispatcher needs. That is
+	// Every migration before the one that adds the table the current dispatcher needs. That is
 	// the state a consuming service is in while it is a version behind.
-	set, err := migrations.PlatformMigrations()
-	if err != nil {
-		t.Fatalf("PlatformMigrations: %v", err)
-	}
-	for _, migration := range set {
-		if strings.Contains(migration.Name, "delivery_receipt") {
-			break
-		}
-		if err := behind.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-			_, err := tx.Exec(ctx, migration.SQL)
-			return err
-		}); err != nil {
-			t.Fatalf("applying %s: %v", migration.Name, err)
-		}
-	}
+	behind := databaseMigratedUntil(t, ctx, "delivery_receipt")
 
 	dispatcher := newTestDispatcher(t, behind, &fakePublisher{}, Config{Consumer: "preflight"})
 
@@ -101,6 +71,74 @@ func TestRunRefusesWhenARequiredTableIsMissing(t *testing.T) {
 	if !strings.Contains(runErr.Error(), "migrations") {
 		t.Errorf("the diagnostic does not say what to do about it: %v", runErr)
 	}
+}
+
+// The same skew one migration later: every table exists, but platform.outbox has no lease
+// columns, so every claim would fail. A table-level check alone would pass here.
+func TestRunRefusesWhenTheLeaseColumnsAreMissing(t *testing.T) {
+	requireDatabase(t)
+	ctx := boundedContext(t)
+
+	behind := databaseMigratedUntil(t, ctx, "outbox_lease")
+	dispatcher := newTestDispatcher(t, behind, &fakePublisher{}, Config{Consumer: "preflight"})
+
+	runErr := dispatcher.Run(ctx)
+	if runErr == nil {
+		t.Fatal("Run started against a platform.outbox with no lease columns; every claim would have failed")
+	}
+	if !errors.Is(runErr, ErrPrerequisite) {
+		t.Fatalf("Run returned %v, which is not classified as a contract failure", runErr)
+	}
+	for _, column := range []string{"platform.outbox.lease_id", "platform.outbox.leased_until"} {
+		if !strings.Contains(runErr.Error(), column) {
+			t.Errorf("the diagnostic does not name %s: %v", column, runErr)
+		}
+	}
+}
+
+// databaseMigratedUntil builds a throwaway database with every platform migration before the
+// first one whose name contains stopAt.
+//
+// A separate database rather than a DROP against the shared one, for the reason given above.
+// CREATE DATABASE cannot run inside a transaction block, and db.Pool exposes no path that is not
+// one — deliberately, since every statement this module issues belongs in a transaction. A lone
+// pgx connection is the exception, and it is confined to these two statements.
+func databaseMigratedUntil(t *testing.T, ctx context.Context, stopAt string) *db.Pool {
+	t.Helper()
+
+	name := fmt.Sprintf("platform_preflight_%d", time.Now().UnixNano())
+	outsideTx(t, ctx, "CREATE DATABASE "+name)
+	t.Cleanup(func() {
+		outsideTx(t, context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+	})
+
+	behind, err := db.Open(ctx, db.Config{Name: "preflight-behind", DSN: replaceDatabase(adminDSN(t), name), MaxConns: 2})
+	if err != nil {
+		t.Fatalf("opening the throwaway database: %v", err)
+	}
+	t.Cleanup(behind.Close)
+
+	set, err := migrations.PlatformMigrations()
+	if err != nil {
+		t.Fatalf("PlatformMigrations: %v", err)
+	}
+	stopped := false
+	for _, migration := range set {
+		if strings.Contains(migration.Name, stopAt) {
+			stopped = true
+			break
+		}
+		if err := behind.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+			_, err := tx.Exec(ctx, migration.SQL)
+			return err
+		}); err != nil {
+			t.Fatalf("applying %s: %v", migration.Name, err)
+		}
+	}
+	if !stopped {
+		t.Fatalf("no platform migration is named for %q, so the database is fully migrated", stopAt)
+	}
+	return behind
 }
 
 // TestRunRefusesWhenAPrivilegeIsMissing is the other half, and the one the owner-run suite could
