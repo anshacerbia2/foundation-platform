@@ -143,6 +143,8 @@ func TestRepeatedApplicationLeavesTheSchemaCorrect(t *testing.T) {
 			{"platform.idempotency_key", "idempotency_key_key_valid"},
 			{"platform.idempotency_key", "idempotency_key_digest_valid"},
 			{"platform.processed_event", "processed_event_consumer_valid"},
+			{"platform.dead_letter", "dead_letter_resolution_complete"},
+			{"platform.dead_letter", "dead_letter_waiver_complete"},
 		} {
 			count := scanOne[int](ctx, t, tx,
 				`SELECT count(*) FROM pg_constraint WHERE conrelid = $1::regclass AND conname = $2`,
