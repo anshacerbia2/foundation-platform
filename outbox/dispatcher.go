@@ -375,11 +375,17 @@ WHERE created_at = $1 AND event_id = $2`
 // the partition was dropped the incident record survived and the ability to act on it did
 // not. See 0004 for why that mattered: REPLAYED is the only first-hand evidence the
 // resolution contract has.
+//
+// consumer is the destination that refused the event, which is Config.Consumer. The column
+// existed from 0001 and was never written, so every dead letter was nobody's: a host could not
+// tell whose projection a poison event left behind, and had to treat one consumer's refusal as
+// every consumer's debt. Written, a host can attribute debt to the consumer it belongs to. Rows
+// dead-lettered before this keep NULL, and a host must read NULL as belonging to everyone.
 const deadLetterStatement = `INSERT INTO platform.dead_letter
     (event_id, event_type, envelope, payload, aggregate_id, priority, failure_class,
-     failure_detail, attempts, first_failed_at)
+     failure_detail, attempts, first_failed_at, consumer)
 SELECT event_id, event_type, envelope, payload, aggregate_id, priority, $3, $4, $5,
-       COALESCE(first_failed_at, now())
+       COALESCE(first_failed_at, now()), $6
 FROM platform.outbox
 WHERE created_at = $1 AND event_id = $2
 ON CONFLICT (event_id) DO NOTHING`
@@ -404,7 +410,7 @@ func (d *Dispatcher) fail(ctx context.Context, tx db.Tx, row claimed, class Fail
 	switch disposition := decide(class, row.priority, attempts, d.cfg.MaxAttempts); disposition {
 	case dispositionDeadLetter:
 		if _, err := tx.Exec(ctx, deadLetterStatement,
-			row.createdAt, row.eventID, string(class), detail, attempts); err != nil {
+			row.createdAt, row.eventID, string(class), detail, attempts, d.cfg.Consumer); err != nil {
 			return fmt.Errorf("outbox: dead-lettering %s: %w", row.eventID, err)
 		}
 		if _, err := tx.Exec(ctx, stopRedeliveryStatement,

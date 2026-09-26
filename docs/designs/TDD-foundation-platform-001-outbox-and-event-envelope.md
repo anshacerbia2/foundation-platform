@@ -264,7 +264,7 @@ CREATE TABLE platform.dead_letter (
     event_type           TEXT        NOT NULL,
     envelope             JSONB,                -- nulled by disposal
     payload              JSONB,                -- nulled by disposal
-    consumer             TEXT,                 -- not written by the dispatcher
+    consumer             TEXT,                 -- the destination that refused it; NULL before v0.2.8
     failure_class        TEXT        NOT NULL,
     failure_detail       TEXT        NOT NULL,
     attempts             INTEGER     NOT NULL,
@@ -298,6 +298,13 @@ removes, and the incident record would outlive the ability to act on it. Rows wr
 these columns existed were backfilled from the outbox where it still held them. The rest stay
 null, because a guessed `aggregate_id` names a real aggregate somewhere, and the replay would
 deliver the event under the wrong subject.
+
+**A row names whose debt it is.** `consumer` is `Config.Consumer`, the destination that refused
+the event. Until v0.2.8 the column existed and nothing wrote it. That meant every dead letter
+belonged to nobody, so a host had to charge one consumer's refusal to every consumer. With the
+column written, a host can attribute debt to the consumer it belongs to. Rows from before v0.2.8
+keep `NULL`, and a host must read `NULL` as belonging to everyone. This module does not know which
+consumers exist, and does not check the name against a registry.
 
 **A closure is a record, not a timestamp.** `dead_letter_resolution_complete` refuses a
 `resolved_at` without a type, an actor, and a reference to the evidence, and it refuses blank
@@ -727,6 +734,7 @@ The host also supplies the maintenance boundaries. This design's values are:
   refused at construction.
 - A dispatcher missing a required table or privilege refuses to start. One whose contract is met
   starts.
+- A dead letter names the consumer that refused it.
 - A receipt past retention that nothing cites is pruned, and one inside retention is kept. A
   receipt a closure cites is never pruned. Nothing is pruned while an incident is open. A mutation
   removing either the citation clause or the open-incident clause turns its test red; both were
