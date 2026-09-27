@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-002
   title: HTTP Substrate, Persistence, and Telemetry
   owner: Core Platform Team
-  version: 1.1.0
+  version: 1.2.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-11
-  last_reviewed: 2026-08-11
+  last_reviewed: 2026-09-28
   parent_sad:
     - SAD-001
     - SAD-004
@@ -285,7 +285,7 @@ that names nothing.
 | `DB_MAX_CONNS` | `20` | Pool ceiling, set per pool by the consumer |
 | `DB_MAX_CONN_LIFETIME` | `30m` | Connection recycling |
 | `DB_ACQUIRE_TIMEOUT` | `3s` | Bound on waiting for a connection |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | none, required | Telemetry export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | The Collector's OTLP/HTTP base URL. The composition root passes it to `observability.Export`. A deployment must set it; unset, a deployable exports nothing and logs a warning at startup, and the absent-telemetry alert fires |
 | `LOG_LEVEL` | `info` | Structured log level |
 
 Each consuming deployable supplies its own values. This library reads no configuration
@@ -327,6 +327,9 @@ directly; the composition root constructs and injects it.
   into the outbox envelope, across the broker, and into the consumer span.
 - The consumer span links to the producer span explicitly.
 - No log line contains a token, credential, key, or unrestricted personal data.
+- `observability.Export` delivers a recorded metric to `/v1/metrics` and an ended span to
+  `/v1/traces` on the Collector, flushed by `Shutdown`, and refuses an endpoint that is not an
+  http(s) URL or telemetry with no `deployable` or `system`.
 
 ## Security Notes
 
