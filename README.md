@@ -270,7 +270,9 @@ transport defaults, and every error written by `httpapi.Problem` comes from the 
 RFC 7807 registry.
 
 `observability.New` receives process-owned OpenTelemetry providers and a `slog.Logger`.
-It starts no exporter. Correlation is propagated or generated at the HTTP boundary,
+It starts no exporter. `observability.Export` does: given the Collector's OTLP/HTTP endpoint,
+which the composition root reads from `OTEL_EXPORTER_OTLP_ENDPOINT`, it returns metric and trace
+providers to hand to `New`, and a `Shutdown` that flushes them on exit. Correlation is propagated or generated at the HTTP boundary,
 embedded in event data through `observability.MetadataFromContext`, restored by the
 consumer, and linked to the producer span by `StartConsumer`.
 
