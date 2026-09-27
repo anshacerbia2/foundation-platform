@@ -220,6 +220,11 @@ func TestPoisonDeadLettersOnTheFirstFailure(t *testing.T) {
 	if s.lastError == nil || strings.Contains(*s.lastError, "visible") || !strings.Contains(*s.lastError, "[REDACTED]") {
 		t.Errorf("last_error was not safely redacted: %v", s.lastError)
 	}
+	// The closed row and its incident record must tell the same story. A row carrying a failure
+	// class and an error message but a stale attempt count describes a failure that never happened.
+	if dl := deadLetterAttempts(ctx, t, p, e.ID.String()); dl != s.attempts {
+		t.Errorf("dead_letter.attempts = %d but outbox.attempts = %d; the two records disagree", dl, s.attempts)
+	}
 }
 
 func TestAnUnavailableBrokerSchedulesARetryRatherThanAbandoning(t *testing.T) {
@@ -284,7 +289,10 @@ func TestABackedOffRowIsNotClaimedUntilItsDelayElapses(t *testing.T) {
 	}
 }
 
-func TestAStandardRowIsDeadLetteredOnceItsAttemptsAreSpent(t *testing.T) {
+// A standard row survives an outage that outlasts its attempts, as a priority row does, and
+// publishes once the consumer recovers. It used to be dead-lettered at its third attempt: the system
+// proof's outage phase showed a two-second consumer restart dead-lettering every grant behind it.
+func TestAStandardRowSurvivesAnOutageThatOutlastsItsAttempts(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
@@ -293,31 +301,35 @@ func TestAStandardRowIsDeadLetteredOnceItsAttemptsAreSpent(t *testing.T) {
 	pub := &fakePublisher{err: errors.New("connection refused")}
 	// No backoff, so the row is immediately claimable and the attempts can be spent
 	// without waiting.
-	d := newTestDispatcher(t, p, pub, Config{MaxAttempts: 3, BackoffBase: time.Nanosecond})
+	d := newTestDispatcher(t, p, pub, Config{MaxAttempts: 3, BackoffBase: time.Nanosecond, BackoffMax: time.Nanosecond})
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 6; i++ {
 		if _, err := d.dispatchOnce(ctx, false); err != nil {
 			t.Fatalf("dispatch %d: %v", i, err)
 		}
 	}
 
-	if got := deadLetterCount(ctx, t, p, e.ID.String()); got != 1 {
-		t.Fatalf("%d dead-letter rows after three attempts, want 1", got)
+	if got := deadLetterCount(ctx, t, p, e.ID.String()); got != 0 {
+		t.Fatalf("%d dead-letter rows after an outage of six attempts, want none: an outage is not poison", got)
 	}
-
 	s := readState(ctx, t, p, e.ID.String())
-	if !s.published {
-		t.Error("the dead-lettered row is still claimable")
-	}
-	if s.attempts != 3 {
-		t.Errorf("attempts = %d, want 3", s.attempts)
+	switch {
+	case s.published:
+		t.Fatal("the row is marked published while every attempt failed")
+	case s.attempts != 6:
+		t.Errorf("attempts = %d, want 6: the count is kept across the release", s.attempts)
+	case s.failureClass == nil || *s.failureClass != string(FailureUnavailable):
+		t.Errorf("failure_class = %v, want unavailable", s.failureClass)
 	}
 
-	// The closed row and its incident record must tell the same story. A row carrying a
-	// failure class and an error message but a stale attempt count describes a failure
-	// that never happened.
-	if dl := deadLetterAttempts(ctx, t, p, e.ID.String()); dl != s.attempts {
-		t.Errorf("dead_letter.attempts = %d but outbox.attempts = %d; the two records disagree", dl, s.attempts)
+	pub.mu.Lock()
+	pub.err = nil
+	pub.mu.Unlock()
+	if _, err := d.dispatchOnce(ctx, false); err != nil {
+		t.Fatalf("dispatch after recovery: %v", err)
+	}
+	if s := readState(ctx, t, p, e.ID.String()); !s.published {
+		t.Error("the row did not publish once the consumer recovered")
 	}
 }
 

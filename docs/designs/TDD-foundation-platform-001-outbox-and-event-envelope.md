@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.7.0
+  version: 1.8.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -649,8 +649,7 @@ for each claimed row, in priority then sequence order, outside any transaction:
         decide:
             poison                               -> dead-letter
             attempts < MaxAttempts               -> retry after backoff
-            priority = 0                         -> release after escalating backoff
-            otherwise                            -> dead-letter
+            otherwise                            -> release after escalating backoff
 
         dead-letter: mark published to stop redelivery, then copy to platform.dead_letter
         retry, release: next_attempt_at := now() + backoff
@@ -660,7 +659,7 @@ for each claimed row, in priority then sequence order, outside any transaction:
 | :-- | :-- | :-- | :-- |
 | poison | any | dead-letter | dead-letter |
 | unavailable | `0` (security) | retry | **release, never dead-letter** |
-| unavailable | `100` (lifecycle) | retry | dead-letter |
+| unavailable | `100` (lifecycle) | retry | **release, never dead-letter** |
 
 Priority `0` carries security events and `100` carries lifecycle events. Two workers are
 reserved for the priority lane so a lifecycle backlog cannot delay a revocation.
@@ -670,18 +669,24 @@ Retry uses exponential backoff with equal jitter, from `BackoffBase` doubling pe
 the count accumulates across claims. Empty polls back off up to `IdleInterval`, so an idle
 dispatcher does not wake the database on a fixed interval.
 
-**Why a priority event is never dead-lettered for unavailability.** Dead-lettering is a
-mechanism for poison messages: three attempts then abandon is calibrated for an event
-that will never succeed. A broker outage is not that. Applying the poison rule to an
-outage discards a revocation that would have published a minute later, and the
-publisher cannot compensate — `organization-control` holds no Keycloak credential and
-cannot enforce the change itself. So a priority event that exhausts its three local attempts
-returns to the pool with escalating backoff, which honours the standard's local-retry bound
-without abandoning the event.
+**Why no event is dead-lettered for unavailability.** Dead-lettering is a mechanism for poison
+messages: three attempts then abandon is calibrated for an event that will never succeed. An
+outage is not that. Applying the poison rule to an outage discards a revocation that would have
+published a minute later, and the publisher cannot compensate — `organization-control` holds no
+Keycloak credential and cannot enforce the change itself. So an event that exhausts its three
+local attempts returns to the pool with escalating backoff, which honours the standard's
+local-retry bound without abandoning the event.
 
-The attempt count is kept on release rather than reset. What protects a priority row from being
-abandoned is the decision rule, not the size of the number: `decide` returns *release* for a
-priority row at any count, so the row can never reach dead-letter through unavailability.
+This held for the priority lane alone until v0.2.12. A standard row was dead-lettered at its third
+attempt, and organization-control's system proof measured the cost. A consumer down for about two
+seconds dead-lettered every Membership grant queued behind it. organization-control counts those
+as security debt, so every projection-backed check refused until an operator replayed and resolved
+each one. A routine restart became an incident only a person could end. An outage in either lane now
+waits it out, and the outbox lag alert shows the wait.
+
+The attempt count is kept on release rather than reset. What protects a row from being abandoned
+is the decision rule, not the size of the number: `decide` returns *release* at any count, so a
+row can never reach dead-letter through unavailability.
 Keeping the count lets the backoff grow toward `BackoffMax` instead of oscillating, and leaves an
 operator able to see what an outage has cost.
 
@@ -813,11 +818,13 @@ The host also supplies the maintenance boundaries. This design's values are:
   answer that arrives as shutdown begins is still recorded with its receipt.
 - A **poison** classification dead-letters on the first failure, with its failure class,
   attempt count, and first-failure timestamp.
-- A **standard** row failing with `unavailable` is dead-lettered once its attempts are spent.
-- A **priority** row failing repeatedly with `unavailable` is never dead-lettered. The decision
-  function is asserted over 499 consecutive failures, and a database-backed row over 10: it
-  returns to the pool, its backoff escalates to the ceiling, and it publishes once the consumer
-  recovers.
+- A row failing repeatedly with `unavailable` is never dead-lettered, in either lane. The decision
+  function is asserted over 499 consecutive failures in each lane. A database-backed priority row is
+  asserted over 10 failures, and a standard row over 6: each returns to the pool, its backoff
+  escalates to the ceiling, and it publishes once the consumer recovers.
+- organization-control's system proof takes the consumer down while a revocation and a backlog of
+  grants queue. The revocation is retried past its attempts and never dead-lettered, and the whole
+  backlog drains once the consumer is back.
 - Backoff intervals grow exponentially and carry jitter.
 
 ### Evidence and Preflight
