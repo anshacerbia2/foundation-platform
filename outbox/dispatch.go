@@ -148,9 +148,10 @@ const (
 	// so it stops being redelivered.
 	dispositionDeadLetter
 
-	// dispositionRelease returns a priority row to the unpublished pool, keeping its attempt
-	// count so the backoff keeps escalating, and it keeps trying for as long as the outage
-	// lasts. decide never dead-letters a priority row for unavailability at any count.
+	// dispositionRelease returns a row whose local attempts are spent to the unpublished pool,
+	// keeping its attempt count so the backoff keeps escalating, and it keeps trying for as long as
+	// the outage lasts. decide never dead-letters a row for unavailability at any count, in either
+	// lane.
 	dispositionRelease
 )
 
@@ -171,16 +172,27 @@ func (d disposition) String() string {
 //
 // attempts is the count including the attempt that just failed.
 //
-// The rule worth reading twice is the last one: a priority row is never dead-lettered for
-// unavailability. Dead-lettering is calibrated for a message that will never succeed —
-// three attempts, then abandon. A broker outage is not that. So a priority row exhausts
-// its local retries, returns to the pool, and publishes when the broker recovers.
+// The rule worth reading twice is the last one: no row is dead-lettered for unavailability, in
+// either lane. Dead-lettering is calibrated for a message that will never succeed. An outage is
+// not that. So a row exhausts its local retries, returns to the pool with escalating backoff, and
+// publishes when the consumer recovers.
 //
-// What bounds enforcement meanwhile is not delivery but the consumer: a projection past
-// its max_accepted_age under fail_closed denies. An outage delays enforcement; it does
-// not remove it. That leaves exactly one unbounded path — a priority event classified
-// poison — which is a containment failure and is alerted at any occurrence.
+// It used to hold for the priority lane only, and a standard row was dead-lettered once its three
+// attempts were spent. The system proof's outage phase showed what that cost. A consumer down for
+// about two seconds, a routine restart, dead-lettered every Membership grant queued behind it.
+// organization-control counts those as security debt, so every projection-backed check in the
+// estate refused until an operator replayed and resolved each one. An outage became an incident
+// that only a person could end.
+//
+// What bounds enforcement meanwhile is not delivery but the consumer: a projection past its
+// max_accepted_age under fail_closed denies. What makes a stuck row visible is the outbox lag
+// alert. That leaves dead-lettering for poison alone, which is a containment failure and is
+// alerted at any occurrence.
+//
+// priority no longer decides anything here. It stays in the signature because the lanes still
+// differ in claiming and in what an operator is alerted on, and a future rule may need it.
 func decide(class FailureClass, priority int16, attempts, maxAttempts int) disposition {
+	_ = priority
 	if class == FailurePoison {
 		// No attempts are spent on a message that cannot succeed.
 		return dispositionDeadLetter
@@ -188,10 +200,7 @@ func decide(class FailureClass, priority int16, attempts, maxAttempts int) dispo
 	if attempts < maxAttempts {
 		return dispositionRetry
 	}
-	if priority == PriorityHigh {
-		return dispositionRelease
-	}
-	return dispositionDeadLetter
+	return dispositionRelease
 }
 
 // backoffFor returns the delay before a failed row may be claimed again.

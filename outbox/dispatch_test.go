@@ -48,8 +48,8 @@ func TestDecideCoversEveryCombination(t *testing.T) {
 		{"first failure retries, standard", FailureUnavailable, PriorityStandard, 1, dispositionRetry},
 		{"below the limit retries", FailureUnavailable, PriorityStandard, 2, dispositionRetry},
 
-		{"standard row is abandoned at the limit", FailureUnavailable, PriorityStandard, 3, dispositionDeadLetter},
-		{"standard row past the limit stays abandoned", FailureUnavailable, PriorityStandard, 9, dispositionDeadLetter},
+		{"standard row is released at the limit", FailureUnavailable, PriorityStandard, 3, dispositionRelease},
+		{"standard row past the limit stays released", FailureUnavailable, PriorityStandard, 9, dispositionRelease},
 
 		{"priority row is released at the limit", FailureUnavailable, PriorityHigh, 3, dispositionRelease},
 		{"priority row past the limit stays released", FailureUnavailable, PriorityHigh, 99, dispositionRelease},
@@ -62,12 +62,15 @@ func TestDecideCoversEveryCombination(t *testing.T) {
 	}
 }
 
-// The rule the design states twice because it is the one most likely to be optimised away
-// by someone tidying up the retry logic.
-func TestAPriorityRowIsNeverDeadLetteredForUnavailability(t *testing.T) {
-	for attempts := 1; attempts < 500; attempts++ {
-		if got := decide(FailureUnavailable, PriorityHigh, attempts, 3); got == dispositionDeadLetter {
-			t.Fatalf("a priority row was dead-lettered for unavailability after %d attempts", attempts)
+// The rule the design states twice because it is the one most likely to be optimised away by
+// someone tidying up the retry logic. Both lanes: a standard row dead-lettered on an outage is how a
+// consumer restart used to create estate-wide security debt.
+func TestNoRowIsDeadLetteredForUnavailability(t *testing.T) {
+	for _, priority := range []int16{PriorityHigh, PriorityStandard} {
+		for attempts := 1; attempts < 500; attempts++ {
+			if got := decide(FailureUnavailable, priority, attempts, 3); got == dispositionDeadLetter {
+				t.Fatalf("a row in lane %d was dead-lettered for unavailability after %d attempts", priority, attempts)
+			}
 		}
 	}
 }
