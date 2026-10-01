@@ -574,3 +574,52 @@ func (s *countingSource) Refetch() error {
 	}
 	return nil
 }
+
+// TestAnAccessTokenTypeIsRequiredWhenAsked is RFC 9068 §4: a resource server checks the header typ
+// is at+jwt, which is what keeps an ID token from passing as an access token.
+func TestAnAccessTokenTypeIsRequiredWhenAsked(t *testing.T) {
+	strict, err := verify.New(verify.Config{
+		Issuer: testIssuer, Audience: testAudience, Keys: keys(), Requirement: requirement,
+		MaxSkew: 30 * time.Second, Now: func() time.Time { return fixedNow }, RequireAccessTokenType: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for typ, accepted := range map[string]bool{
+		"at+jwt": true, "AT+JWT": true, "application/at+jwt": true,
+		"JWT": false, "": false, "id+jwt": false, "logout+jwt": false,
+	} {
+		head := validHeader()
+		if typ == "" {
+			delete(head, "typ")
+		} else {
+			head["typ"] = typ
+		}
+		claims, err := strict.Verify(sign(t, signingKey, head, validPayload()))
+		switch {
+		case accepted && err != nil:
+			t.Errorf("typ %q was refused: %v", typ, err)
+		case accepted && claims.TokenType() != typ:
+			t.Errorf("typ %q reported as %q", typ, claims.TokenType())
+		case !accepted && !errors.Is(err, verify.ErrTokenType):
+			t.Errorf("typ %q answered %v, want ErrTokenType", typ, err)
+		}
+	}
+}
+
+// TestWithoutTheRequirementAJWTTypeIsReported is the rollout state: a token typed JWT is accepted,
+// and the consumer can count it.
+func TestWithoutTheRequirementAJWTTypeIsReported(t *testing.T) {
+	claims, err := newVerifier(t, keys()).Verify(sign(t, signingKey, validHeader(), validPayload()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.TokenType() != "JWT" {
+		t.Errorf("TokenType = %q, want JWT", claims.TokenType())
+	}
+	head := validHeader()
+	head["typ"] = "at+jwt"
+	if _, err := newVerifier(t, keys()).Verify(sign(t, signingKey, head, validPayload())); err != nil {
+		t.Errorf("an at+jwt token was refused without the requirement: %v", err)
+	}
+}

@@ -49,6 +49,7 @@ var (
 	ErrNotYetValid      = errors.New("verify: token is not yet valid")
 	ErrUnknownKey       = errors.New("verify: signing key is unknown")
 	ErrClaimRequirement = errors.New("verify: token does not satisfy the required claims")
+	ErrTokenType        = errors.New("verify: token is not an access token")
 	ErrKeysUnavailable  = errors.New("verify: signing material is unavailable")
 )
 
@@ -77,8 +78,13 @@ type Claims struct {
 	IssuedAt  time.Time
 	NotBefore time.Time
 
-	raw map[string]json.RawMessage
+	raw        map[string]json.RawMessage
+	headerType string
 }
+
+// TokenType is the token's header typ, as the issuer wrote it. A consumer rolling out
+// Config.RequireAccessTokenType reads it to count the tokens that rule would refuse.
+func (c Claims) TokenType() string { return c.headerType }
 
 // String returns a string claim by name.
 func (c Claims) String(name string) (string, bool) {
@@ -165,6 +171,14 @@ type Config struct {
 	// checks the mechanics and nothing about what the claims mean, and STD-IAM-002 §3.5 is
 	// not satisfied by the mechanics alone.
 	Requirement ClaimRequirement
+
+	// RequireAccessTokenType refuses a token whose header typ is not at+jwt or application/at+jwt,
+	// the type RFC 9068 §2.1 gives a JWT access token and §4 requires a resource server to check.
+	// It is what keeps an ID token, which carries the same issuer and signature, from passing as an
+	// access token (STD-IAM-002 §3.5 step 5). Off, a typ of JWT or none is also accepted, which is
+	// the rollout state while an issuer's clients are moved to at+jwt; Claims.TokenType reports
+	// what each token carried.
+	RequireAccessTokenType bool
 
 	// MaxSkew tolerates clock drift, capped at 60 seconds.
 	MaxSkew time.Duration
@@ -262,7 +276,11 @@ func (v *Verifier) Verify(token string) (Claims, error) {
 		return Claims{}, fmt.Errorf("verify: alg %q is not %s: %w",
 			head.Algorithm, permittedAlgorithm, ErrAlgorithm)
 	}
-	if head.Type != "" && !strings.EqualFold(head.Type, "JWT") && !strings.EqualFold(head.Type, "at+jwt") {
+	accessToken := strings.EqualFold(head.Type, "at+jwt") || strings.EqualFold(head.Type, "application/at+jwt")
+	switch {
+	case v.cfg.RequireAccessTokenType && !accessToken:
+		return Claims{}, fmt.Errorf("verify: typ %q is not at+jwt: %w", head.Type, ErrTokenType)
+	case head.Type != "" && !strings.EqualFold(head.Type, "JWT") && !accessToken:
 		return Claims{}, fmt.Errorf("verify: typ %q is not a JWT: %w", head.Type, ErrMalformed)
 	}
 	if head.KeyID == "" {
@@ -288,6 +306,7 @@ func (v *Verifier) Verify(token string) (Claims, error) {
 	if err != nil {
 		return Claims{}, err
 	}
+	claims.headerType = head.Type
 
 	if err := v.checkRegistered(claims); err != nil {
 		return Claims{}, err
