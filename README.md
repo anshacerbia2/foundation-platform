@@ -258,6 +258,11 @@ bug:
 - **`jku`, `x5u`, `jwk`, and `x5c` are unreachable.** They are absent from the header struct
   rather than parsed and ignored. Honouring any of them lets the presenter of a token nominate
   the key that validates it, which removes the signature as a control entirely.
+- **`RequireAccessTokenType` refuses anything but an access token.** With it set, the header
+  `typ` must be `at+jwt` or `application/at+jwt` (RFC 9068 §4); a token typed `JWT`, an ID
+  token among them, is refused with `ErrTokenType`. It is a setting rather than the default only
+  for the rollout, while an issuer's clients are moved to `at+jwt`: `Claims.TokenType()` reports
+  each token's `typ`, so a consumer can count what the rule would refuse before turning it on.
 - **An unknown `kid` refetches once, then rejects.** The refetch is rate limited, because the
   key identifier is the one input an attacker chooses and an unbounded refetch turns random
   identifiers into a denial of service against a Tier-0 dependency.
