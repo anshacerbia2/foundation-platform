@@ -78,8 +78,19 @@ CREATE TABLE IF NOT EXISTS platform.outbox (
 
 -- The dispatcher's only index. It covers unpublished rows alone, so it stays small
 -- regardless of history, and its column order matches the claim query's ORDER BY exactly.
-CREATE INDEX IF NOT EXISTS outbox_unpublished
-    ON platform.outbox (priority, sequence) WHERE published = FALSE;
+--
+-- Guarded since 0009 (ADR-GLB-018) moved publication state to platform.outbox_delivery and
+-- dropped this column. The set is applied whole on every deployment, so without the guard a
+-- second application would fail here on a column that no longer exists.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'platform.outbox'::regclass AND attname = 'published' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS outbox_unpublished
+            ON platform.outbox (priority, sequence) WHERE published = FALSE;
+    END IF;
+END
+$$;
 
 -- A default partition, so an insert never fails for want of one.
 --

@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 1.8.0
+  version: 2.0.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-09-27
+  last_reviewed: 2026-10-02
   parent_sad:
     - SAD-001
     - SAD-004
@@ -75,7 +75,7 @@ Three enterprise rules constrain the design and are treated as requirements rath
 than as guidance:
 
 1. **STD-GLB-004** mandates the CloudEvents 1.0 envelope, a UUID `event_id` as the
-   outbox primary key, a `published` boolean, consumer deduplication keyed on
+   outbox primary key, publication state, consumer deduplication keyed on
    `event_id`, three local retries with exponential backoff, and dead-letter routing.
    Its exception clause reads *None. All event-driven architecture rules apply
    unconditionally.*
@@ -88,7 +88,11 @@ than as guidance:
    promotion inside the event type, and registration in the enterprise Schema
    Registry.
 
-The design satisfies all three. Where an enterprise rule and an earlier draft of the
+A fourth decision shapes delivery. **ADR-GLB-018** delivers one outbox to several named
+consumers, each with its own subscription, publication state, evidence and dead letters
+(§Per-Consumer Delivery).
+
+The design satisfies all four. Where an enterprise rule and an earlier draft of the
 consuming designs disagreed, the enterprise rule wins and the consuming design is
 corrected.
 
@@ -158,30 +162,18 @@ CREATE TABLE platform.outbox (
     priority     SMALLINT    NOT NULL DEFAULT 100,
     payload      JSONB       NOT NULL,
     envelope     JSONB       NOT NULL,
-    published    BOOLEAN     NOT NULL DEFAULT FALSE,
-    published_at TIMESTAMPTZ,
-    attempts     INTEGER     NOT NULL DEFAULT 0,
-    last_error   TEXT,
-    failure_class   TEXT,
-    first_failed_at TIMESTAMPTZ,
-    next_attempt_at TIMESTAMPTZ,
-    lease_id     UUID,
-    leased_until TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (created_at, event_id),
-    CONSTRAINT outbox_lease_complete CHECK ((lease_id IS NULL) = (leased_until IS NULL))
+    PRIMARY KEY (created_at, event_id)
 ) PARTITION BY RANGE (created_at);
-
-CREATE INDEX outbox_unpublished
-    ON platform.outbox (priority, sequence) WHERE published = FALSE;
 ```
 
 `event_id` is the UUID identifier STD-GLB-004 requires, and it is the key consumers
-deduplicate on. `published` is the mandated boolean and carries the partial index;
-`published_at` records when, for latency measurement, and is never used as the
-predicate.
+deduplicate on. The outbox row is the event, written once. What happened to it at each
+consumer is that consumer's delivery row (§Per-Consumer Delivery), which carries the
+publication state and every column below. They lived on the outbox row until v0.3.0, when one
+row could describe only one consumer's outcome.
 
-Three columns were added during implementation because the dispatch algorithm below
+Three delivery columns were added during implementation because the dispatch algorithm below
 cannot be expressed without them, and each is named by that algorithm or by a table it
 writes to.
 
@@ -214,8 +206,9 @@ exposing sequential entity identifiers in STD-GLB-002 therefore does not apply t
 
 Partitioning exists so processed blocks are truncated in bulk.
 The partition key appears in the primary key because PostgreSQL requires it. Daily
-partitions are created ahead of time by a scheduled job, and partitions whose rows
-are fully published and older than the retention window are dropped.
+partitions are created ahead of time by a scheduled job, for the outbox and its deliveries
+together, and a day whose deliveries are all published, or dead-lettered, and older than the
+retention window is dropped from both.
 
 A `DEFAULT` partition exists so an insert never fails for want of one. The append runs
 inside the caller's domain transaction, so a missing daily partition would abort a
@@ -239,6 +232,95 @@ across two partitions would publish twice and be discarded once at each consumer
 recorded here because this design quotes STD-GLB-004's no-exception clause and then
 takes one, and an unrecorded deviation is how a standard quietly stops meaning
 anything.
+
+### Per-Consumer Delivery
+
+`ADR-GLB-018` delivers one outbox to several named consumers. A consumer **subscribes** to event
+types, and each appended event writes, in the same transaction, one **delivery** for each active
+subscription whose types include the event's.
+
+```sql
+CREATE TABLE platform.subscription (
+    consumer      TEXT        NOT NULL CHECK (btrim(consumer) <> ''),
+    event_types   TEXT[]      NOT NULL CHECK (cardinality(event_types) > 0),
+    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    retired_at    TIMESTAMPTZ,
+    PRIMARY KEY (consumer, subscribed_at)
+);
+CREATE UNIQUE INDEX subscription_active ON platform.subscription (consumer) WHERE retired_at IS NULL;
+
+CREATE TABLE platform.outbox_delivery (
+    created_at      TIMESTAMPTZ NOT NULL,          -- the event's, so both partition together
+    event_id        UUID        NOT NULL,
+    consumer        TEXT        NOT NULL,
+    sequence        BIGINT      NOT NULL,          -- the event's, for claim order
+    event_type      TEXT        NOT NULL,
+    priority        SMALLINT    NOT NULL,          -- the event's lane
+    published       BOOLEAN     NOT NULL DEFAULT FALSE,
+    published_at    TIMESTAMPTZ,
+    attempts        INTEGER     NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    failure_class   TEXT,
+    first_failed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    lease_id        UUID,
+    leased_until    TIMESTAMPTZ,
+    PRIMARY KEY (created_at, event_id, consumer),
+    CONSTRAINT outbox_delivery_lease_complete CHECK ((lease_id IS NULL) = (leased_until IS NULL))
+) PARTITION BY RANGE (created_at);
+CREATE INDEX outbox_delivery_unpublished
+    ON platform.outbox_delivery (consumer, priority, sequence) WHERE published = FALSE;
+```
+
+**A subscription is replaced, not edited.** `Subscribe(tx, consumer, types)` retires the
+consumer's active subscription and records the new one. No runtime role updates `event_types`,
+as Google's subscription filter "is an immutable property of a subscription" (`ADR-GLB-018`
+[R2]). A consumer that needs a type it did not receive re-bootstraps from the producer's
+snapshot. A type no subscription names is still appended, and nobody is owed it.
+
+**No event commits without the deliveries it owes.** Append and a subscription change are
+ordered by a transaction-scoped advisory lock on one key:
+
+- `Append` takes it **shared**, so appends never wait for each other.
+- `Subscribe` takes it **exclusive**. It therefore waits for every transaction already appending
+  to commit, and appends wait for the new subscription to commit.
+
+Without the lock, an event appended before a subscription committed, in a transaction that
+commits after it, would hold no delivery for the new subscriber. It would also miss the
+snapshot that subscriber bootstraps from, if the snapshot ran before the late commit. With the
+lock, every event either commits before the subscription exists, and is in the snapshot, or sees
+the subscription and owes it a delivery.
+
+**Why rows and not a per-consumer position.** A position over the outbox sequence would be the
+smaller change. It is unsafe because a sequence value is taken at insert and not at commit. A
+transaction holding a lower value can commit after one holding a higher value, and a consumer
+already past the higher value would never be delivered the lower one (`ADR-GLB-018 §5.2`,
+Alternative A).
+
+**A replay is owed to one consumer.** `Append(..., To(consumer))` writes the delivery for that
+consumer alone, and only when it subscribes to the type. A dead letter is one consumer's
+refusal, and replaying it to every subscriber would deliver again to consumers that applied it
+the first time. They would discard the replay, at the cost of a delivery each. A `To` that writes
+no delivery returns `ErrNotSubscribed`, so the caller's transaction rolls back rather than
+committing an event owed to nobody: a replay that delivered nothing must not read as one that
+succeeded.
+
+**The dispatch role's grants.** `SELECT, UPDATE` on `platform.outbox_delivery`, `SELECT` on
+`platform.outbox` for the envelope, and `INSERT, SELECT` on `platform.dead_letter` and
+`platform.delivery_receipt` as before. The preflight checks each, and the `consumer`, `lease_id`
+and `leased_until` columns. Only a producer's own transactions write `platform.subscription`.
+
+**Upgrade.** v0.3.0 moves the publication state off `platform.outbox`, so an event still
+unpublished when the migration runs has no delivery and is never dispatched. Drain the outbox
+before upgrading. No production estate exists, and the migration says so rather than inventing a
+consumer for those events.
+
+**The set stays re-runnable.** The set is applied whole on every deployment. `0001`'s
+`outbox_unpublished` index and `0008`'s lease columns are therefore created only while
+`platform.outbox` still has its `published` column. Without that guard, a second application
+would fail on a dropped column, or re-add columns for `0009` to drop again. `0009` adds
+`dead_letter_delivery` once rather than dropping and re-adding it, which would rebuild its index
+on every deployment.
 
 ### Deduplication
 
@@ -269,7 +351,7 @@ which is the failure mode this key shape exists to prevent.
 
 ```sql
 CREATE TABLE platform.dead_letter (
-    event_id             UUID        PRIMARY KEY,
+    event_id             UUID        NOT NULL,
     event_type           TEXT        NOT NULL,
     envelope             JSONB,                -- nulled by disposal
     payload              JSONB,                -- nulled by disposal
@@ -297,9 +379,15 @@ CREATE TABLE platform.dead_letter (
     CONSTRAINT dead_letter_waiver_complete CHECK (
         (waived_at IS NULL AND waived_until IS NULL AND waived_by IS NULL AND waiver_reason IS NULL)
      OR (waived_at IS NOT NULL AND waived_until > waived_at
-            AND btrim(waived_by) <> '' AND btrim(waiver_reason) <> ''))
+            AND btrim(waived_by) <> '' AND btrim(waiver_reason) <> '')),
+    CONSTRAINT dead_letter_delivery UNIQUE NULLS NOT DISTINCT (event_id, consumer)
 );
 ```
+
+**A dead letter is one consumer's** (v0.3.0, `ADR-GLB-018 §5.3`). It is keyed by the event and
+the consumer that refused it. Two consumers refusing one event are two incidents, each closed on
+its own consumer's evidence. A row from before v0.2.8 has no consumer, and the key still holds
+it once: `NULLS NOT DISTINCT` makes a second `NULL` row for the same event a conflict.
 
 A row here means an event was accepted by a domain transaction and never reached its
 consumer. For a priority event that is a containment failure, so the alert on this table is
@@ -529,6 +617,14 @@ func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope
 // Priority marks an event for the reserved dispatch lane.
 func Priority() Option
 
+// To owes the event to one consumer alone, for a replay of that consumer's dead letter. Append
+// returns ErrNotSubscribed when that consumer does not subscribe to the event's type.
+func To(consumer string) Option
+
+// Subscribe replaces the consumer's subscription with these event types; Unsubscribe retires it.
+func Subscribe(ctx context.Context, tx db.Tx, consumer string, eventTypes []event.Type) error
+func Unsubscribe(ctx context.Context, tx db.Tx, consumer string) error
+
 // Publisher is the host's delivery adapter. Wrapping ErrPoison marks a permanent refusal;
 // any other error is unavailability.
 type Publisher interface {
@@ -607,17 +703,19 @@ No secret, token, credential, or unrestricted personal data appears in any field
 
 ```text
 before any worker starts:
-    verify USAGE on platform, the three tables exist, platform.outbox has the lease
+    verify USAGE on platform, the four tables exist, platform.outbox_delivery has the lease
     columns, and this role holds
-    outbox SELECT+UPDATE, dead_letter INSERT+SELECT, delivery_receipt INSERT+SELECT
+    outbox SELECT, outbox_delivery SELECT+UPDATE, dead_letter INSERT+SELECT,
+    delivery_receipt INSERT+SELECT
     any gap -> ErrPrerequisite, and no worker starts
 
-claim, in one short transaction:
+claim Config.Consumer's deliveries, in one short transaction:
     lease := a new UUID
-    UPDATE platform.outbox SET lease_id = lease, leased_until = now() + LeaseDuration
+    UPDATE platform.outbox_delivery SET lease_id = lease, leased_until = now() + LeaseDuration
     WHERE the row is one of
-        SELECT ... FROM platform.outbox
-        WHERE published = FALSE
+        SELECT ... FROM platform.outbox_delivery
+        WHERE consumer = Config.Consumer
+          AND published = FALSE
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
           AND (leased_until IS NULL OR leased_until <= now())
           AND (:any_lane OR priority = :lane)
@@ -651,7 +749,8 @@ for each claimed row, in priority then sequence order, outside any transaction:
             attempts < MaxAttempts               -> retry after backoff
             otherwise                            -> release after escalating backoff
 
-        dead-letter: mark published to stop redelivery, then copy to platform.dead_letter
+        dead-letter: mark the delivery published to stop redelivery, then copy the event,
+                     with Config.Consumer, to platform.dead_letter
         retry, release: next_attempt_at := now() + backoff
 ```
 
@@ -836,6 +935,14 @@ The host also supplies the maintenance boundaries. This design's values are:
   refused at construction.
 - A dispatcher missing a required table, the lease columns, or a privilege refuses to start. One
   whose contract is met starts.
+- Each subscriber is owed its own delivery and its dispatcher settles that delivery alone. A type
+  nobody subscribes to is owed to nobody. One consumer's refusal parks its own delivery, and two
+  consumers' refusals of one event are two dead letters.
+- `To` owes a replay to one consumer and refuses one owed to nobody. A replaced subscription owes
+  only its new types, and a retired one owes nothing new.
+- A subscription waits for an append in flight; that event is not owed to it, and the next one is.
+- A delivery lands in its event's day partition. Re-applying the migration set leaves
+  `platform.outbox` with no publication columns and `platform.dead_letter` with no primary key.
 - A dead letter names the consumer that refused it.
 - The schema refuses a waiver without an author, a reason, or an expiry after it began. An
   unexpired waiver silences the stale alert and an expired one does not; a waived payload is

@@ -82,7 +82,7 @@ func readLease(ctx context.Context, t *testing.T, p *db.Pool, eventID string) le
 		return tx.QueryRow(ctx, `
 			SELECT lease_id IS NOT NULL, coalesce(leased_until > now(), false), published, attempts,
 			       failure_class IS NOT NULL
-			FROM platform.outbox WHERE event_id = $1`, eventID,
+			FROM platform.outbox_delivery WHERE event_id = $1 AND consumer = $2`, eventID, subscriber,
 		).Scan(&s.leased, &s.leaseLive, &s.published, &s.attempts, &s.failureSeen)
 	}); err != nil {
 		t.Fatalf("reading the lease: %v", err)
@@ -134,7 +134,7 @@ func TestNoLockIsHeldWhilePublishing(t *testing.T) {
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		var one int
 		return tx.QueryRow(ctx,
-			`SELECT 1 FROM platform.outbox WHERE event_id = $1 FOR UPDATE NOWAIT`, e.ID.String()).Scan(&one)
+			`SELECT 1 FROM platform.outbox_delivery WHERE event_id = $1 FOR UPDATE NOWAIT`, e.ID.String()).Scan(&one)
 	}); err != nil {
 		t.Fatalf("the row is locked while its publication is in flight: %v", err)
 	}

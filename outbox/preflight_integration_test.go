@@ -73,23 +73,51 @@ func TestRunRefusesWhenARequiredTableIsMissing(t *testing.T) {
 	}
 }
 
-// The same skew one migration later: every table exists, but platform.outbox has no lease
-// columns, so every claim would fail. A table-level check alone would pass here.
-func TestRunRefusesWhenTheLeaseColumnsAreMissing(t *testing.T) {
+// The same skew one release later: every v0.2 table exists, but the per-consumer delivery table
+// does not (ADR-GLB-018), so this dispatcher has nothing it can claim.
+func TestRunRefusesWhenPerConsumerDeliveryIsMissing(t *testing.T) {
 	requireDatabase(t)
 	ctx := boundedContext(t)
 
-	behind := databaseMigratedUntil(t, ctx, "outbox_lease")
+	behind := databaseMigratedUntil(t, ctx, "per_consumer_delivery")
 	dispatcher := newTestDispatcher(t, behind, &fakePublisher{}, Config{Consumer: "preflight"})
 
 	runErr := dispatcher.Run(ctx)
 	if runErr == nil {
-		t.Fatal("Run started against a platform.outbox with no lease columns; every claim would have failed")
+		t.Fatal("Run started against a database with no platform.outbox_delivery; every claim would have failed")
 	}
 	if !errors.Is(runErr, ErrPrerequisite) {
 		t.Fatalf("Run returned %v, which is not classified as a contract failure", runErr)
 	}
-	for _, column := range []string{"platform.outbox.lease_id", "platform.outbox.leased_until"} {
+	if !strings.Contains(runErr.Error(), "platform.outbox_delivery") {
+		t.Errorf("the diagnostic does not name the missing table: %v", runErr)
+	}
+}
+
+// A table that exists without the columns the claim writes. A table-level check alone would pass
+// here, and every claim would fail.
+func TestRunRefusesWhenTheLeaseColumnsAreMissing(t *testing.T) {
+	requireDatabase(t)
+	ctx := boundedContext(t)
+
+	behind := databaseMigratedUntil(t, ctx, "per_consumer_delivery")
+	if err := behind.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := tx.Exec(ctx, `CREATE TABLE platform.outbox_delivery
+			(created_at TIMESTAMPTZ, event_id UUID, consumer TEXT, published BOOLEAN)`)
+		return err
+	}); err != nil {
+		t.Fatalf("creating an incomplete delivery table: %v", err)
+	}
+	dispatcher := newTestDispatcher(t, behind, &fakePublisher{}, Config{Consumer: "preflight"})
+
+	runErr := dispatcher.Run(ctx)
+	if runErr == nil {
+		t.Fatal("Run started against a platform.outbox_delivery with no lease columns; every claim would have failed")
+	}
+	if !errors.Is(runErr, ErrPrerequisite) {
+		t.Fatalf("Run returned %v, which is not classified as a contract failure", runErr)
+	}
+	for _, column := range []string{"platform.outbox_delivery.lease_id", "platform.outbox_delivery.leased_until"} {
 		if !strings.Contains(runErr.Error(), column) {
 			t.Errorf("the diagnostic does not name %s: %v", column, runErr)
 		}
@@ -161,9 +189,10 @@ func TestRunRefusesWhenAPrivilegeIsMissing(t *testing.T) {
 		// Everything the contract asks for except INSERT on the receipt table. The dispatcher
 		// would otherwise reach its first publication before discovering this.
 		for statement, on := range map[string]string{
-			"GRANT SELECT, UPDATE ON platform.outbox TO %s":      "outbox",
-			"GRANT INSERT, SELECT ON platform.dead_letter TO %s": "dead_letter",
-			"GRANT SELECT ON platform.delivery_receipt TO %s":    "delivery_receipt",
+			"GRANT SELECT ON platform.outbox TO %s":                  "outbox",
+			"GRANT SELECT, UPDATE ON platform.outbox_delivery TO %s": "outbox_delivery",
+			"GRANT INSERT, SELECT ON platform.dead_letter TO %s":     "dead_letter",
+			"GRANT SELECT ON platform.delivery_receipt TO %s":        "delivery_receipt",
 		} {
 			if _, err := tx.Exec(ctx, fmt.Sprintf(statement, role)); err != nil {
 				return fmt.Errorf("granting on %s: %w", on, err)

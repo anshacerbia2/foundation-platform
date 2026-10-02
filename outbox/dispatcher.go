@@ -31,14 +31,13 @@ type Config struct {
 	// Consumer names the destination this dispatcher delivers to.
 	//
 	// Required, and it is identity rather than labelling: a delivery receipt is an answer
-	// about a delivery -- this event, to this consumer -- and platform.outbox's single
-	// `published` flag is exactly what cannot express that. A receipt written without a
+	// about a delivery -- this event, to this consumer -- and a receipt written without a
 	// consumer would establish that an event was delivered somewhere, which resolves nothing.
 	//
-	// One dispatcher, one destination. A second destination is a second dispatcher with its
-	// own name, and the fan-out that would need -- one delivery row per (event, consumer) --
-	// is deliberately not built: the enforcement scope is one producer and one projection
-	// consumer, and organization-control refuses a second active one.
+	// One dispatcher, one consumer (ADR-GLB-018 §5.4). It claims only this consumer's rows in
+	// platform.outbox_delivery, so its leases, backoff and lanes are this consumer's, and a
+	// slow consumer never holds another's priority lane. A second consumer is a second
+	// dispatcher with its own name, endpoint and credential.
 	Consumer string
 
 	// Interval is the poll period. It sets a latency floor on accept-to-claim, which the
@@ -255,10 +254,14 @@ type claimed struct {
 // It takes the reserved lane as a parameter rather than embedding the priority value, so the
 // predicate cannot drift from the Go constant it is meant to match. RETURNING has no order, so
 // claim sorts the batch itself.
+//
+// It claims this consumer's deliveries only (ADR-GLB-018 §5.4), and reads each event's envelope
+// from platform.outbox, where the event is written once.
 const claimStatement = `WITH batch AS (
     SELECT created_at, event_id
-    FROM platform.outbox
-    WHERE published = FALSE
+    FROM platform.outbox_delivery
+    WHERE consumer = $6
+      AND published = FALSE
       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
       AND (leased_until IS NULL OR leased_until <= now())
       AND ($1::boolean = FALSE OR priority = $3)
@@ -266,11 +269,12 @@ const claimStatement = `WITH batch AS (
     LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
-UPDATE platform.outbox AS o
+UPDATE platform.outbox_delivery AS d
 SET lease_id = $4::uuid, leased_until = now() + make_interval(secs => $5)
 FROM batch
-WHERE o.created_at = batch.created_at AND o.event_id = batch.event_id
-RETURNING o.created_at, o.event_id::text, o.event_type, o.sequence, o.priority, o.attempts, o.envelope`
+WHERE d.created_at = batch.created_at AND d.event_id = batch.event_id AND d.consumer = $6
+RETURNING d.created_at, d.event_id::text, d.event_type, d.sequence, d.priority, d.attempts,
+    (SELECT o.envelope FROM platform.outbox o WHERE o.created_at = d.created_at AND o.event_id = d.event_id)`
 
 // settleTimeout bounds each outcome's transaction.
 //
@@ -340,7 +344,7 @@ func (d *Dispatcher) dispatchOnce(ctx context.Context, priorityOnly bool) (int, 
 
 func (d *Dispatcher) claim(ctx context.Context, tx db.Tx, priorityOnly bool, lease string) ([]claimed, error) {
 	rows, err := tx.Query(ctx, claimStatement, priorityOnly, d.cfg.BatchSize, PriorityHigh,
-		lease, d.cfg.LeaseDuration.Seconds())
+		lease, d.cfg.LeaseDuration.Seconds(), d.cfg.Consumer)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: claiming a batch: %w", err)
 	}
@@ -428,9 +432,9 @@ func fenced(ctx context.Context, tx db.Tx, what, statement string, args ...any) 
 }
 
 // releaseStatement returns a leased row to the pool at once, without counting an attempt.
-const releaseStatement = `UPDATE platform.outbox
+const releaseStatement = `UPDATE platform.outbox_delivery
 SET lease_id = NULL, leased_until = NULL
-WHERE created_at = $1 AND event_id = $2 AND lease_id = $3::uuid AND published = FALSE`
+WHERE created_at = $1 AND event_id = $2 AND consumer = $4 AND lease_id = $3::uuid AND published = FALSE`
 
 // release gives back rows this worker leased and will not publish, so a shutdown does not
 // leave them waiting for the lease to expire. Best effort: a row it fails to release becomes
@@ -441,7 +445,7 @@ func (d *Dispatcher) release(ctx context.Context, rows []claimed, lease string) 
 	}
 	_ = d.record(ctx, func(ctx context.Context, tx db.Tx) error {
 		for _, row := range rows {
-			if _, err := tx.Exec(ctx, releaseStatement, row.createdAt, row.eventID, lease); err != nil {
+			if _, err := tx.Exec(ctx, releaseStatement, row.createdAt, row.eventID, lease, d.cfg.Consumer); err != nil {
 				return err
 			}
 		}
@@ -451,10 +455,10 @@ func (d *Dispatcher) release(ctx context.Context, rows []claimed, lease string) 
 
 // markPublishedStatement is fenced on the lease. A worker whose lease was taken over matches
 // no row and records nothing, including no receipt.
-const markPublishedStatement = `UPDATE platform.outbox
+const markPublishedStatement = `UPDATE platform.outbox_delivery
 SET published = TRUE, published_at = now(), last_error = NULL, failure_class = NULL,
     next_attempt_at = NULL, lease_id = NULL, leased_until = NULL
-WHERE created_at = $1 AND event_id = $2 AND lease_id = $3::uuid AND published = FALSE`
+WHERE created_at = $1 AND event_id = $2 AND consumer = $4 AND lease_id = $3::uuid AND published = FALSE`
 
 // recordReceiptStatement records what this delivery established.
 //
@@ -477,7 +481,7 @@ ON CONFLICT (event_id, consumer) DO NOTHING`
 func (d *Dispatcher) markPublished(ctx context.Context, row claimed, lease string, receipt Receipt) error {
 	return d.record(ctx, func(ctx context.Context, tx db.Tx) error {
 		if err := fenced(ctx, tx, "marking "+row.eventID+" published",
-			markPublishedStatement, row.createdAt, row.eventID, lease); err != nil {
+			markPublishedStatement, row.createdAt, row.eventID, lease, d.cfg.Consumer); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, recordReceiptStatement,
@@ -491,14 +495,14 @@ func (d *Dispatcher) markPublished(ctx context.Context, row claimed, lease strin
 // recordFailureStatement counts the attempt and schedules the next one. now() is the start of
 // this outcome's own transaction, which begins after the publication returned, so
 // first_failed_at and next_attempt_at are measured from the failure and not from the claim.
-const recordFailureStatement = `UPDATE platform.outbox
+const recordFailureStatement = `UPDATE platform.outbox_delivery
 SET attempts = $3,
     last_error = $4,
     failure_class = $5,
     first_failed_at = COALESCE(first_failed_at, now()),
     next_attempt_at = now() + make_interval(secs => $6),
     lease_id = NULL, leased_until = NULL
-WHERE created_at = $1 AND event_id = $2 AND lease_id = $7::uuid AND published = FALSE`
+WHERE created_at = $1 AND event_id = $2 AND consumer = $8 AND lease_id = $7::uuid AND published = FALSE`
 
 // deadLetterStatement copies the row into platform.dead_letter, reading envelope and
 // payload from the outbox rather than from the dispatcher's memory so the two cannot
@@ -517,14 +521,19 @@ WHERE created_at = $1 AND event_id = $2 AND lease_id = $7::uuid AND published = 
 // tell whose projection a poison event left behind, and had to treat one consumer's refusal as
 // every consumer's debt. Written, a host can attribute debt to the consumer it belongs to. Rows
 // dead-lettered before this keep NULL, and a host must read NULL as belonging to everyone.
+//
+// The incident is this consumer's (ADR-GLB-018 §5.3), keyed by the event and the consumer, so
+// another consumer's refusal of the same event is a second incident and not a conflict.
 const deadLetterStatement = `INSERT INTO platform.dead_letter
     (event_id, event_type, envelope, payload, aggregate_id, priority, failure_class,
      failure_detail, attempts, first_failed_at, consumer)
-SELECT event_id, event_type, envelope, payload, aggregate_id, priority, $3, $4, $5,
-       COALESCE(first_failed_at, now()), $6
-FROM platform.outbox
-WHERE created_at = $1 AND event_id = $2
-ON CONFLICT (event_id) DO NOTHING`
+SELECT o.event_id, o.event_type, o.envelope, o.payload, o.aggregate_id, o.priority, $3, $4, $5,
+       COALESCE(d.first_failed_at, now()), $6
+FROM platform.outbox o
+JOIN platform.outbox_delivery d
+  ON d.created_at = o.created_at AND d.event_id = o.event_id AND d.consumer = $6
+WHERE o.created_at = $1 AND o.event_id = $2
+ON CONFLICT ON CONSTRAINT dead_letter_delivery DO NOTHING`
 
 // stopRedeliveryStatement marks a dead-lettered row published so the dispatcher stops
 // claiming it. published here means "no longer this dispatcher's concern" rather than
@@ -538,11 +547,11 @@ ON CONFLICT (event_id) DO NOTHING`
 //
 // It runs before the dead-letter insert and is fenced on the lease, so a worker that lost its
 // lease rolls back without writing an incident.
-const stopRedeliveryStatement = `UPDATE platform.outbox
+const stopRedeliveryStatement = `UPDATE platform.outbox_delivery
 SET published = TRUE, attempts = $5, last_error = $3, failure_class = $4,
     next_attempt_at = NULL, first_failed_at = COALESCE(first_failed_at, now()),
     lease_id = NULL, leased_until = NULL
-WHERE created_at = $1 AND event_id = $2 AND lease_id = $6::uuid AND published = FALSE`
+WHERE created_at = $1 AND event_id = $2 AND consumer = $7 AND lease_id = $6::uuid AND published = FALSE`
 
 func (d *Dispatcher) fail(ctx context.Context, row claimed, lease string, class FailureClass, detail string) error {
 	attempts := row.attempts + 1
@@ -551,7 +560,7 @@ func (d *Dispatcher) fail(ctx context.Context, row claimed, lease string, class 
 	case dispositionDeadLetter:
 		return d.record(ctx, func(ctx context.Context, tx db.Tx) error {
 			if err := fenced(ctx, tx, "closing "+row.eventID+" for dead-letter", stopRedeliveryStatement,
-				row.createdAt, row.eventID, detail, string(class), attempts, lease); err != nil {
+				row.createdAt, row.eventID, detail, string(class), attempts, lease, d.cfg.Consumer); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, deadLetterStatement,
@@ -577,7 +586,7 @@ func (d *Dispatcher) fail(ctx context.Context, row claimed, lease string, class 
 		delay := backoffFor(d.cfg.BackoffBase, attempts, d.cfg.BackoffMax, d.jitter())
 		return d.record(ctx, func(ctx context.Context, tx db.Tx) error {
 			return fenced(ctx, tx, "recording failure for "+row.eventID, recordFailureStatement,
-				row.createdAt, row.eventID, attempts, detail, string(class), delay.Seconds(), lease)
+				row.createdAt, row.eventID, attempts, detail, string(class), delay.Seconds(), lease, d.cfg.Consumer)
 		})
 
 	default:

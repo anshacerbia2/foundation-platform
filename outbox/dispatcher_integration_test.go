@@ -43,7 +43,7 @@ func (f *fakePublisher) count() int {
 	return len(f.published)
 }
 
-// state is the dispatch-relevant slice of a row.
+// state is the dispatch-relevant slice of the subscriber's delivery of an event.
 type state struct {
 	published     bool
 	publishedAt   *time.Time
@@ -62,7 +62,7 @@ func readState(ctx context.Context, t *testing.T, p *db.Pool, eventID string) st
 		return tx.QueryRow(ctx, `
 			SELECT published, published_at, attempts, failure_class, last_error,
 			       next_attempt_at, first_failed_at
-			FROM platform.outbox WHERE event_id = $1`, eventID,
+			FROM platform.outbox_delivery WHERE event_id = $1 AND consumer = $2`, eventID, subscriber,
 		).Scan(&s.published, &s.publishedAt, &s.attempts, &s.failureClass, &s.lastError,
 			&s.nextAttemptAt, &s.firstFailedAt)
 	}); err != nil {
@@ -104,7 +104,7 @@ func clearOutbox(ctx context.Context, t *testing.T, p *db.Pool) {
 	t.Helper()
 
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-		if _, err := tx.Exec(ctx, "TRUNCATE platform.outbox"); err != nil {
+		if _, err := tx.Exec(ctx, "TRUNCATE platform.outbox, platform.outbox_delivery"); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, "TRUNCATE platform.dead_letter")
@@ -119,10 +119,10 @@ func clearOutbox(ctx context.Context, t *testing.T, p *db.Pool) {
 func newTestDispatcher(t *testing.T, p *db.Pool, pub Publisher, cfg Config) *Dispatcher {
 	t.Helper()
 
-	// Consumer is required and never defaulted, so the helper supplies one. Tests that care
-	// which consumer a receipt names set it themselves.
+	// Consumer is required and never defaulted, so the helper supplies the one TestMain
+	// subscribed. Tests that care which consumer a receipt names set it, and subscribe it.
 	if cfg.Consumer == "" {
-		cfg.Consumer = "test-consumer"
+		cfg.Consumer = subscriber
 	}
 	d, err := NewDispatcher(p, pub, cfg)
 	if err != nil {
@@ -223,7 +223,7 @@ func TestPoisonDeadLettersOnTheFirstFailure(t *testing.T) {
 	// The closed row and its incident record must tell the same story. A row carrying a failure
 	// class and an error message but a stale attempt count describes a failure that never happened.
 	if dl := deadLetterAttempts(ctx, t, p, e.ID.String()); dl != s.attempts {
-		t.Errorf("dead_letter.attempts = %d but outbox.attempts = %d; the two records disagree", dl, s.attempts)
+		t.Errorf("dead_letter.attempts = %d but the delivery's attempts = %d; the two records disagree", dl, s.attempts)
 	}
 }
 
@@ -447,11 +447,15 @@ func TestTenThousandLifecycleRowsDoNotDelayPriorityClaim(t *testing.T) {
 	clearOutbox(ctx, t, p)
 
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
-		_, err := tx.Exec(ctx, `INSERT INTO platform.outbox
-			(event_id, event_type, aggregate_id, priority, payload, envelope)
+		_, err := tx.Exec(ctx, `WITH e AS (
+			INSERT INTO platform.outbox
+			    (event_id, event_type, aggregate_id, priority, payload, envelope)
 			SELECT gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
 			       gen_random_uuid(), $1, '{}'::jsonb, '{}'::jsonb
-			FROM generate_series(1, 10000)`, PriorityStandard)
+			FROM generate_series(1, 10000)
+			RETURNING created_at, event_id, sequence, event_type, priority)
+			INSERT INTO platform.outbox_delivery (created_at, event_id, consumer, sequence, event_type, priority)
+			SELECT created_at, event_id, $2, sequence, event_type, priority FROM e`, PriorityStandard, subscriber)
 		return err
 	}); err != nil {
 		t.Fatalf("creating lifecycle backlog: %v", err)

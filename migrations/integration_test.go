@@ -145,6 +145,9 @@ func TestRepeatedApplicationLeavesTheSchemaCorrect(t *testing.T) {
 			{"platform.processed_event", "processed_event_consumer_valid"},
 			{"platform.dead_letter", "dead_letter_resolution_complete"},
 			{"platform.dead_letter", "dead_letter_waiver_complete"},
+			{"platform.dead_letter", "dead_letter_delivery"},
+			{"platform.outbox_delivery", "outbox_delivery_lease_complete"},
+			{"platform.subscription", "subscription_types_present"},
 		} {
 			count := scanOne[int](ctx, t, tx,
 				`SELECT count(*) FROM pg_constraint WHERE conrelid = $1::regclass AND conname = $2`,
@@ -152,6 +155,21 @@ func TestRepeatedApplicationLeavesTheSchemaCorrect(t *testing.T) {
 			if count != 1 {
 				t.Errorf("%s on %s: count = %d, want 1", constraint.name, constraint.table, count)
 			}
+		}
+
+		// ADR-GLB-018: publication state lives on the delivery alone. A guard that let 0001 or
+		// 0008 re-add it on the second application would leave a column nothing writes.
+		outboxPublicationColumns := scanOne[int](ctx, t, tx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_schema = 'platform' AND table_name = 'outbox'
+			    AND column_name IN ('published', 'attempts', 'lease_id', 'leased_until')`)
+		if outboxPublicationColumns != 0 {
+			t.Errorf("platform.outbox carries %d publication columns after re-application, want 0", outboxPublicationColumns)
+		}
+		deadLetterPrimaryKeys := scanOne[int](ctx, t, tx,
+			`SELECT count(*) FROM pg_constraint WHERE conrelid = 'platform.dead_letter'::regclass AND contype = 'p'`)
+		if deadLetterPrimaryKeys != 0 {
+			t.Errorf("platform.dead_letter has a primary key again; its key is (event_id, consumer)")
 		}
 
 		// A column count guards against a guard that adds the column again under another name.
