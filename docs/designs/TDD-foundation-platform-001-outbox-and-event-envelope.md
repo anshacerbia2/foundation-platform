@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.1.0
+  version: 2.2.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -727,6 +727,44 @@ Every HTTP error is serialized per RFC 7807 as required by STD-GLB-001:
 ```
 
 No secret, token, credential, or unrestricted personal data appears in any field.
+
+
+### HTTP Delivery
+
+`outbox/httpdelivery` is the Direct Durable Delivery adapter (`ADR-GLB-016 §5.4`): an
+`outbox.Publisher` that posts each envelope to one consumer's acceptance API. It was
+`foundation-reference`'s `internal/dispatch` and moved here when the producer took over its
+consumers' dispatchers (`ADR-GLB-018 §5.4`). The producer and the reference consumer now run one
+implementation of the contract below.
+
+```go
+package httpdelivery
+
+// TokenSource supplies the credential each delivery carries. clientauth.Tokens is the
+// production one (TDD-foundation-platform-002 §Workload Client Credentials).
+type TokenSource interface {
+    Token(ctx context.Context) (string, error)
+    Invalidate()
+}
+
+func NewPublisher(cfg Config) (*Publisher, error) // Endpoint, Tokens, Timeout, Telemetry
+func (p *Publisher) Publish(ctx context.Context, e event.Envelope) (outbox.Receipt, error)
+```
+
+- **2xx** is published, and the receipt's class comes from the consumer's
+  `X-Application-Receipt: applied` alone (`outbox.ReceiptFromMarker`).
+- **400, 409, 422** are poison: the consumer will refuse the event the same way every time.
+- **401** drops the cached token and is retryable: the consumer may have restarted, or the token
+  may have expired in flight. **Every other status, a transport failure and a timeout are
+  retryable.** That includes 403: a withdrawn credential is an operator's problem, and
+  dead-lettering the estate's events for it would turn a credential change into lost authority.
+- **A refusal contributes at most 4 KiB** of its body to the dead letter.
+- **The correlation identifier travels** as `X-Correlation-Id`, so the producer's log, the
+  delivery and the consumer's refusal join on one value.
+
+A token source is required, and a delivery is never sent unauthenticated. `StaticToken` exists for
+a consumer with no workload identity, such as a local proof. A production producer authenticates
+as its workload (`STD-IAM-001 §3`).
 
 ## Algorithms / Logic
 

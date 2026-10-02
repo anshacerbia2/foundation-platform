@@ -25,6 +25,8 @@ it is worth more than the coupling one shared dependency introduces.
 | :-- | :-- |
 | `id` | UUIDv7 generation, parsing, and ordering — the canonical identifier form under STD-GLB-002 |
 | `outbox` | Outbox append, dispatcher, claim and retry policy, dead-letter routing |
+| `outbox/httpdelivery` | The Direct Durable Delivery publisher: posts each envelope to one consumer's acceptance API |
+| `clientauth` | A workload's access token: client credentials with a `private_key_jwt` assertion |
 | `migrations` | The `platform` schema, embedded so consumers receive it through `go.mod` |
 | `event` | CloudEvents 1.0 envelope construction, type naming, schema version binding |
 | `inbox` | Deduplication guard over `platform.processed_event` |

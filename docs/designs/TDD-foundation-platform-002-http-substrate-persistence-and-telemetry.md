@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-002
   title: HTTP Substrate, Persistence, and Telemetry
   owner: Core Platform Team
-  version: 1.2.0
+  version: 1.3.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -136,6 +136,69 @@ func (p *Pool) InTx(ctx context.Context, fn func(context.Context, Tx) error) err
 `outbox.Append(ctx, tx, ...)` from design 001, it means publication outside a domain
 transaction does not compile. The atomicity guarantee is enforced by the type system
 rather than by review.
+
+### Workload Client Credentials
+
+`clientauth` gives a service an access token as its own workload: the OAuth 2.0 client
+credentials grant, authenticated with a signed JWT client assertion (`private_key_jwt`). A
+producer's dispatcher presents this token to a consumer's acceptance API (`ADR-GLB-018 §5.4`), and
+any service calling another as itself uses the same package.
+
+```go
+package clientauth
+
+// LoadKey reads an RSA private key in PKCS#8 or PKCS#1 PEM and refuses one under 3072 bits.
+func LoadKey(path string) (*Key, error)
+
+// Assertion signs an RFC 7523 client assertion, PS256, with a fresh jti.
+func (k *Key) Assertion(clientID, audience string, now time.Time) (string, error)
+
+// NewTokens builds a token source for one client at one token endpoint.
+func NewTokens(cfg Config) (*Tokens, error)
+
+// Token returns a cached access token, or acquires one when none is held or it is within the
+// leeway of its expiry.
+func (t *Tokens) Token(ctx context.Context) (string, error)
+
+// Invalidate drops the cached token, for a resource that refused it with 401.
+func (t *Tokens) Invalidate()
+```
+
+The rules, each from the standard it implements:
+
+- **The grant is client credentials.** A client uses it "when the client is requesting access to
+  the protected resources under its control, or those of another resource owner that have been
+  previously arranged with the authorization server", and it "MUST only be used by confidential
+  clients" (RFC 6749 §4.4 [R1]). A workload holding a private key is a confidential client.
+- **The assertion.** `client_assertion_type` is
+  `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`, and for client authentication "the
+  subject MUST be the 'client_id' of the OAuth client". The client is also the issuer, and the
+  audience "identifies the authorization server as an intended audience" (RFC 7523 §2.2, §3
+  [R2]). The audience is the configured issuer, not an address derived from the token endpoint:
+  a service reaches the kernel on an internal address, and an assertion naming it is refused.
+- **Single use and short-lived.** Each assertion carries a fresh `jti` and expires one minute after
+  it is signed, so the kernel's replay check has a short window to cover (OpenID Connect Core §9,
+  `STD-IAM-001` [R6]).
+- **The key.** RSA of at least 3072 bits, signed `PS256`, with a `kid` that is the key's RFC 7638
+  thumbprint (`STD-IAM-001 §3`, `STD-IAM-002 §3.2.2`). The key is read from a file and never
+  logged.
+- **The token stays in memory.** It is cached until `Leeway` (default 30 s) before its stated
+  expiry. A response with no `expires_in` is used once and not cached. A 400, 401 or 403 from the
+  token endpoint is reported as `ErrRejected` and not retried. Every other failure is
+  `ErrUnavailable`.
+
+It is the same mechanism `identity-control` uses for its Admin API clients
+(`internal/keycloak/clientkey.go`). That copy stays where it is until it has a reason to move.
+
+**The tradeoff.** Every caller needs a client registered in the kernel and a key file to rotate,
+where a shared bearer token needs neither. `STD-IAM-001 §3` prohibits the long-lived static secret
+when a workload identity is available, and a token the resource can verify names the workload,
+where a shared secret names only whoever holds it.
+
+| Ref | Source |
+| :-- | :-- |
+| R1 | IETF, *RFC 6749 The OAuth 2.0 Authorization Framework*, §4.4, <https://www.rfc-editor.org/rfc/rfc6749#section-4.4>, accessed 2026-10-02 |
+| R2 | IETF, *RFC 7523 JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants*, §2.2, §3, <https://www.rfc-editor.org/rfc/rfc7523#section-3>, accessed 2026-10-02 |
 
 ## Data Model
 

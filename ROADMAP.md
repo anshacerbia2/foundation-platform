@@ -284,6 +284,8 @@ activations (`ADR-ORG-002 §5.3`). `TDD-001 §Per-Consumer Delivery` is the curr
 
 | `v0.3.1` | `Abandon(tx, consumer, reason)` closes a retired consumer's owed deliveries as `abandoned`, so they stop holding retention (`ADR-GLB-018 §5.5`). `Append` reads nothing back from the outbox, so a publishing role needs no `SELECT` on it: `INSERT` on `platform.outbox` and `platform.outbox_delivery`, and `SELECT (consumer, event_types, retired_at)` on `platform.subscription` (§5.6) |
 
+| `v0.4.0` | `clientauth`: the client credentials grant with a `private_key_jwt` assertion (RFC 6749 §4.4, RFC 7523), a cached token, and `Invalidate` for a 401. `outbox/httpdelivery`: the Direct Durable Delivery publisher, moved from foundation-reference, now taking a `TokenSource`, so a producer's dispatcher authenticates as its workload (ADR-GLB-018 §5.4, STD-IAM-001 §3). A 401 drops the cached token and retries. `StaticToken` is kept for a local proof |
+
 Consequences for consumers, owned by them:
 
 - `organization-control` subscribes each named consumer, drops `consumer_single_active`, and reads
