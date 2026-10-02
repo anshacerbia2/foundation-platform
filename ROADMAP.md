@@ -282,6 +282,8 @@ activations (`ADR-ORG-002 §5.3`). `TDD-001 §Per-Consumer Delivery` is the curr
 | :-- | :-- |
 | `v0.3.0` | `platform.subscription` and `platform.outbox_delivery` (`0009`). `Append` writes one delivery per subscriber in the event's own transaction, under a shared advisory lock that `Subscribe` takes exclusive. The dispatcher claims `Config.Consumer`'s deliveries alone. A dead letter is keyed `(event_id, consumer)`. `To(consumer)` owes a replay to one consumer and returns `ErrNotSubscribed` when it would owe nobody. **Breaking**: the outbox loses its publication columns, `0001` and `0008` are guarded so the set stays re-runnable, and the dispatch role needs `SELECT, UPDATE` on `platform.outbox_delivery` and only `SELECT` on `platform.outbox`. Drain the outbox before applying `0009`: an unpublished event has no delivery afterwards |
 
+| `v0.3.1` | `Abandon(tx, consumer, reason)` closes a retired consumer's owed deliveries as `abandoned`, so they stop holding retention (`ADR-GLB-018 §5.5`). `Append` reads nothing back from the outbox, so a publishing role needs no `SELECT` on it: `INSERT` on `platform.outbox` and `platform.outbox_delivery`, and `SELECT (consumer, event_types, retired_at)` on `platform.subscription` (§5.6) |
+
 Consequences for consumers, owned by them:
 
 - `organization-control` subscribes each named consumer, drops `consumer_single_active`, and reads

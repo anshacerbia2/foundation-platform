@@ -343,3 +343,164 @@ func TestADeliveryLandsInItsEventsDayPartition(t *testing.T) {
 		t.Errorf("delivery partition = %q, want %q", partition, want)
 	}
 }
+
+// ADR-GLB-018 §5.5: retiring a consumer closes what it was still owed, and nothing else.
+func TestAbandonClosesARetiredConsumersDeliveries(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	clearOutbox(ctx, t, p)
+	clearReceipts(ctx, t, p)
+	subscribed(ctx, t, p, second)
+
+	e, _ := appendOne(ctx, t, p)
+	f, _ := appendOne(ctx, t, p)
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := Abandon(ctx, tx, second, "still subscribed")
+		return err
+	}); !errors.Is(err, ErrStillSubscribed) {
+		t.Fatalf("abandoning a subscribed consumer answered %v, want ErrStillSubscribed", err)
+	}
+
+	var closed int64
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		if err := Unsubscribe(ctx, tx, second); err != nil {
+			return err
+		}
+		var err error
+		closed, err = Abandon(ctx, tx, second, "retired: rebuilt under a new identity")
+		return err
+	}); err != nil {
+		t.Fatalf("retiring %s: %v", second, err)
+	}
+	if closed != 2 {
+		t.Fatalf("abandoned %d deliveries, want 2", closed)
+	}
+
+	for _, event := range []string{e.ID.String(), f.ID.String()} {
+		var published, delivered bool
+		var class *string
+		if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+			return tx.QueryRow(ctx, `SELECT published, published_at IS NOT NULL, failure_class
+				FROM platform.outbox_delivery WHERE event_id = $1 AND consumer = $2`, event, second,
+			).Scan(&published, &delivered, &class)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !published || delivered || class == nil || *class != string(FailureAbandoned) {
+			t.Errorf("%s's delivery reads published=%v delivered=%v class=%v; want closed, undelivered, abandoned",
+				second, published, delivered, class)
+		}
+		if got := deliveries(ctx, t, p, event); got[subscriber] {
+			t.Errorf("abandoning %s closed %s's delivery too", second, subscriber)
+		}
+		if got := readReceipts(ctx, t, p, event); len(got) != 0 {
+			t.Errorf("an abandoned delivery has receipts %v; nothing may cite it", got)
+		}
+	}
+}
+
+// And the reason it exists: an abandoned delivery holds no day of the outbox.
+func TestAnAbandonedDeliveryDoesNotHoldRetention(t *testing.T) {
+	p := requireDatabase(t)
+	ctx := context.Background()
+	day := time.Now().UTC().AddDate(0, 0, -45).Truncate(24 * time.Hour)
+	partition := "outbox_" + day.Format("20060102")
+	const gone = "retired-consumer"
+
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		if _, err := migrations.EnsureOutboxPartitions(ctx, tx, day, day); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `WITH e AS (
+			INSERT INTO platform.outbox
+			    (event_id, event_type, aggregate_id, payload, envelope, created_at)
+			VALUES (gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
+			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1)
+			RETURNING created_at, event_id, sequence, event_type, priority)
+			INSERT INTO platform.outbox_delivery (created_at, event_id, consumer, sequence, event_type, priority)
+			SELECT created_at, event_id, $2, sequence, event_type, priority FROM e`, day.Add(time.Hour), gone)
+		return err
+	}); err != nil {
+		t.Fatalf("preparing the day: %v", err)
+	}
+
+	drop := func() []string {
+		var dropped []string
+		if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+			var err error
+			dropped, err = migrations.DropPublishedOutboxPartitions(ctx, tx, day.Add(48*time.Hour))
+			return err
+		}); err != nil {
+			t.Fatalf("retention: %v", err)
+		}
+		return dropped
+	}
+	if dropped := drop(); len(dropped) != 0 {
+		t.Fatalf("dropped %v while a delivery was owed", dropped)
+	}
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		_, err := Abandon(ctx, tx, gone, "retired")
+		return err
+	}); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+	if dropped := drop(); len(dropped) != 1 || dropped[0] != partition {
+		t.Errorf("dropped %v after the abandonment, want %s", dropped, partition)
+	}
+}
+
+// ADR-GLB-018 §5.6, measured: a role holding only what publishing needs can append, and cannot
+// read the outbox it appends to.
+func TestARoleThatOnlyPublishesCanAppend(t *testing.T) {
+	admin := requireDatabase(t)
+	ctx := boundedContext(t)
+	clearOutbox(ctx, t, admin)
+
+	role := fmt.Sprintf("append_only_%d", time.Now().UnixNano())
+	if err := admin.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		for _, statement := range []string{
+			"CREATE ROLE %s LOGIN PASSWORD 'append'",
+			"GRANT USAGE ON SCHEMA platform TO %s",
+			"GRANT INSERT ON platform.outbox, platform.outbox_delivery TO %s",
+			"GRANT SELECT (consumer, event_types, retired_at) ON platform.subscription TO %s",
+			"GRANT USAGE ON SEQUENCE platform.outbox_sequence TO %s",
+		} {
+			if _, err := tx.Exec(ctx, fmt.Sprintf(statement, role)); err != nil {
+				return fmt.Errorf("%s: %w", statement, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("creating the publishing role: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = admin.InTx(context.Background(), func(ctx context.Context, tx db.Tx) error {
+			_, _ = tx.Exec(ctx, fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", role))
+			_, _ = tx.Exec(ctx, fmt.Sprintf("DROP OWNED BY %s", role))
+			_, _ = tx.Exec(ctx, fmt.Sprintf("DROP ROLE IF EXISTS %s", role))
+			return nil
+		})
+	})
+	publisher, err := db.Open(ctx, db.Config{Name: "append-only", DSN: replaceCredentials(adminDSN(t), role, "append"), MaxConns: 2})
+	if err != nil {
+		t.Fatalf("opening the publishing pool: %v", err)
+	}
+	t.Cleanup(publisher.Close)
+
+	e := newEnvelope(t)
+	if err := publisher.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return Append(ctx, tx, newAggregateID(t), e)
+	}); err != nil {
+		t.Fatalf("a role holding what publishing needs could not append: %v", err)
+	}
+	if got := deliveries(ctx, t, admin, e.ID.String()); !hasKey(got, subscriber) {
+		t.Errorf("deliveries = %v; the append wrote none for %s", got, subscriber)
+	}
+	if err := publisher.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		var n int
+		return tx.QueryRow(ctx, "SELECT count(*) FROM platform.outbox").Scan(&n)
+	}); err == nil {
+		t.Error("the publishing role can read the outbox; the test grants more than publishing needs")
+	}
+}

@@ -71,3 +71,41 @@ func TestUnsubscribeRetiresUnderTheExclusiveLock(t *testing.T) {
 		t.Errorf("an unnamed consumer answered %v, want ErrNoConsumer", err)
 	}
 }
+
+// Abandon takes the lock, refuses a consumer that still subscribes, and closes what is owed.
+func TestAbandonClosesOnlyAnUnsubscribedConsumersDeliveries(t *testing.T) {
+	tx := &dbtest.Tx{RowValues: []any{false}, Tag: dbtest.CommandTag(3)}
+	n, err := Abandon(context.Background(), tx, " retired-projection ", "retired: rebuilt as retired-projection-2")
+	if err != nil || n != 3 {
+		t.Fatalf("Abandon = %d, %v; want 3 closed", n, err)
+	}
+	calls := tx.Calls()
+	if len(calls) != 3 || calls[0].SQL != subscriptionExclusive || calls[1].SQL != activeSubscriptionStatement || calls[2].SQL != abandonStatement {
+		t.Fatalf("statements = %v, want the lock, the subscription check, then the close", calls)
+	}
+	if calls[2].Args[0] != "retired-projection" || calls[2].Args[1] != string(FailureAbandoned) {
+		t.Errorf("abandon args = %v", calls[2].Args)
+	}
+
+	still := &dbtest.Tx{RowValues: []any{true}}
+	if _, err := Abandon(context.Background(), still, "live", "why"); !errors.Is(err, ErrStillSubscribed) {
+		t.Errorf("abandoning a subscribed consumer answered %v, want ErrStillSubscribed", err)
+	}
+	if len(still.Calls()) != 2 {
+		t.Errorf("a refused abandonment sent %d statements, want no close", len(still.Calls()))
+	}
+	for name, c := range map[string]struct {
+		consumer, reason string
+		want             error
+	}{
+		"no consumer": {" ", "why", ErrNoConsumer},
+		"no reason":   {"retired", " ", ErrNoReason},
+	} {
+		if _, err := Abandon(context.Background(), &dbtest.Tx{}, c.consumer, c.reason); !errors.Is(err, c.want) {
+			t.Errorf("%s: %v, want %v", name, err, c.want)
+		}
+	}
+	if _, err := Abandon(context.Background(), nil, "retired", "why"); !errors.Is(err, ErrNoTransaction) {
+		t.Errorf("nil transaction: %v", err)
+	}
+}
