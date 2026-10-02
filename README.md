@@ -169,12 +169,29 @@ import, because a package that starts a goroutine when it is linked cannot be sh
 the process that linked it.
 
 ```go
-dispatcher, err := outbox.NewDispatcher(pool, broker, outbox.Config{})
+dispatcher, err := outbox.NewDispatcher(pool, broker, outbox.Config{Consumer: "foundation-reference"})
 if err != nil {
     return err
 }
 go func() { errs <- dispatcher.Run(ctx) }()
 ```
+
+**One outbox, several consumers** (ADR-GLB-018). A consumer is owed an event when it
+subscribes to the event's type, and `Append` writes one `platform.outbox_delivery` row per
+subscriber in the event's own transaction. Each dispatcher claims only its `Config.Consumer`'s
+deliveries, so one consumer that is down, slow, or refusing never delays, parks, or closes
+another's. Subscribe in the producer's own migration or bootstrap transaction:
+
+```go
+err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+    return outbox.Subscribe(ctx, tx, "foundation-reference", []event.Type{revoked, granted})
+})
+```
+
+A subscription is replaced, never edited. Events committed before it are not owed to the
+consumer, which starts from the producer's snapshot instead. A replay of one consumer's dead
+letter uses `outbox.To(consumer)`, so the consumers that applied the event the first time are
+not sent it again.
 
 `broker` is anything satisfying `outbox.Publisher`. This module holds no broker client: the
 interface is declared here because this package is what needs it, and the adapter that

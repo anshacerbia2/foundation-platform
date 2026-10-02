@@ -55,9 +55,23 @@ func TestAppendWritesTheEnvelopeIdentifierAsTheRowIdentifier(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if got := tx.Only(t).Args[0]; got != e.ID.String() {
+	if got := appended(t, tx).Args[0]; got != e.ID.String() {
 		t.Errorf("event_id = %v, want the envelope identifier %s", got, e.ID)
 	}
+}
+
+// appended is the insert Append sent. It is the second statement: the first takes the shared
+// subscription lock, which must be held before the insert's snapshot reads platform.subscription.
+func appended(t *testing.T, tx *dbtest.Tx) dbtest.Call {
+	t.Helper()
+	calls := tx.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected the lock and the insert, got %d statements: %v", len(calls), calls)
+	}
+	if calls[0].SQL != subscriptionLock {
+		t.Fatalf("the first statement is not the subscription lock:\n%s", calls[0].SQL)
+	}
+	return calls[1]
 }
 
 func TestAppendTargetsTheOutboxTable(t *testing.T) {
@@ -67,7 +81,7 @@ func TestAppendTargetsTheOutboxTable(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	sql := tx.Only(t).SQL
+	sql := appended(t, tx).SQL
 	if !strings.Contains(sql, "platform.outbox") {
 		t.Errorf("statement does not target platform.outbox:\n%s", sql)
 	}
@@ -79,7 +93,8 @@ func TestAppendTargetsTheOutboxTable(t *testing.T) {
 // A column list and a VALUES list that disagree fail at execution, which here means in
 // production, because no test in this package reaches a real database.
 func TestStatementBindsEveryArgument(t *testing.T) {
-	const placeholders = 6
+	// $7 is the To option: empty for every subscriber, or the one consumer a replay names.
+	const placeholders = 7
 	for i := 1; i <= placeholders; i++ {
 		if !strings.Contains(appendStatement, fmt.Sprintf("$%d", i)) {
 			t.Errorf("statement omits placeholder $%d:\n%s", i, appendStatement)
@@ -89,7 +104,7 @@ func TestStatementBindsEveryArgument(t *testing.T) {
 	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t)); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if got := len(tx.Only(t).Args); got != placeholders {
+	if got := len(appended(t, tx).Args); got != placeholders {
 		t.Errorf("%d arguments for %d placeholders", got, placeholders)
 	}
 }
@@ -110,7 +125,7 @@ func TestAppendDefaultsToTheStandardLane(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if got := tx.Only(t).Args[3]; got != PriorityStandard {
+	if got := appended(t, tx).Args[3]; got != PriorityStandard {
 		t.Errorf("priority = %v, want %v", got, PriorityStandard)
 	}
 }
@@ -122,7 +137,7 @@ func TestPriorityRoutesToTheReservedLane(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if got := tx.Only(t).Args[3]; got != PriorityHigh {
+	if got := appended(t, tx).Args[3]; got != PriorityHigh {
 		t.Errorf("priority = %v, want %v", got, PriorityHigh)
 	}
 }
@@ -135,7 +150,7 @@ func TestAppendCarriesTypeAndAggregateAsColumns(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	args := tx.Only(t).Args
+	args := appended(t, tx).Args
 	if args[1] != testType {
 		t.Errorf("event_type = %v, want %s", args[1], testType)
 	}
@@ -155,7 +170,7 @@ func TestPayloadAndEnvelopeAreDistinctColumns(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	args := tx.Only(t).Args
+	args := appended(t, tx).Args
 
 	payload, ok := args[4].([]byte)
 	if !ok {
@@ -189,7 +204,7 @@ func TestStoredEnvelopeIsCloudEventsJSON(t *testing.T) {
 	}
 
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(tx.Only(t).Args[5].([]byte), &members); err != nil {
+	if err := json.Unmarshal(appended(t, tx).Args[5].([]byte), &members); err != nil {
 		t.Fatalf("decoding stored envelope: %v", err)
 	}
 
@@ -276,5 +291,59 @@ func TestPriorityLanesAreOrderedSoHighDispatchesFirst(t *testing.T) {
 	if PriorityHigh >= PriorityStandard {
 		t.Fatalf("PriorityHigh %d must sort before PriorityStandard %d under ORDER BY priority ASC",
 			PriorityHigh, PriorityStandard)
+	}
+}
+
+// The statement fans out to subscribers in the event's own transaction, and To narrows it to one.
+func TestAppendOwesADeliveryToEachSubscriber(t *testing.T) {
+	for _, fragment := range []string{
+		"INSERT INTO platform.outbox_delivery",
+		"JOIN platform.subscription s",
+		"s.retired_at IS NULL",
+		"i.event_type = ANY (s.event_types)",
+		"$7 = '' OR s.consumer = $7",
+	} {
+		if !strings.Contains(appendStatement, fragment) {
+			t.Errorf("append statement omits %q:\n%s", fragment, appendStatement)
+		}
+	}
+
+	tx := &dbtest.Tx{}
+	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := appended(t, tx).Args[6]; got != "" {
+		t.Errorf("an append without To names consumer %q, want every subscriber", got)
+	}
+}
+
+func TestToNamesOneConsumer(t *testing.T) {
+	tx := &dbtest.Tx{Tag: dbtest.CommandTag(1)}
+	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t), To("  reference-projection ")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := appended(t, tx).Args[6]; got != "reference-projection" {
+		t.Errorf("To bound consumer %q, want the trimmed name", got)
+	}
+}
+
+// A replay that wrote no delivery delivered nothing, and must say so.
+func TestToAnUnsubscribedConsumerIsRefused(t *testing.T) {
+	tx := &dbtest.Tx{Tag: dbtest.CommandTag(0)}
+	err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t), To("gone"))
+	if !errors.Is(err, ErrNotSubscribed) {
+		t.Fatalf("err = %v, want ErrNotSubscribed", err)
+	}
+	if !strings.Contains(err.Error(), "gone") {
+		t.Errorf("err = %v, want it to name the consumer", err)
+	}
+}
+
+// Without To, no subscriber is not an error: an event nobody consumes is still the producer's
+// history, and the snapshot carries it.
+func TestAnEventNobodySubscribesToIsStillAppended(t *testing.T) {
+	tx := &dbtest.Tx{Tag: dbtest.CommandTag(0)}
+	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t)); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
 }

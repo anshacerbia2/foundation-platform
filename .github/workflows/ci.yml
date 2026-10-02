@@ -166,7 +166,10 @@ jobs:
         run: |
           file=outbox/dispatcher.go
           cp "$file" "$file.orig"
-          sed -i -E 's/envelope, payload, aggregate_id, priority,/envelope, payload,/g' "$file"
+          # Both the column list and the select list, which since ADR-GLB-018 reads the event
+          # from platform.outbox under an alias. Mutating one alone fails on a column count
+          # rather than on the property.
+          sed -i -E 's/envelope, payload, aggregate_id, priority,/envelope, payload,/g; s/o\.payload, o\.aggregate_id, o\.priority,/o.payload,/g' "$file"
           if git diff --quiet "$file"; then
             echo "::error::the dead-letter retention columns were not found in the insert; this check is silently passing and must be updated"
             mv "$file.orig" "$file"

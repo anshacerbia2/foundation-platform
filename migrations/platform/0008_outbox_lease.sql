@@ -19,14 +19,25 @@
 --
 -- ALTER TABLE on the partitioned parent reaches every partition, existing and future.
 
-ALTER TABLE platform.outbox
-    ADD COLUMN IF NOT EXISTS lease_id     UUID,
-    ADD COLUMN IF NOT EXISTS leased_until TIMESTAMPTZ;
+--
+-- Guarded since 0009 (ADR-GLB-018) moved the lease to platform.outbox_delivery: on a schema that
+-- has already applied 0009 the outbox carries no publication state, and re-adding the lease here
+-- only for 0009 to drop it again would take the outbox's exclusive lock twice per deployment.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'platform.outbox'::regclass AND attname = 'published' AND NOT attisdropped) THEN
+        ALTER TABLE platform.outbox
+            ADD COLUMN IF NOT EXISTS lease_id     UUID,
+            ADD COLUMN IF NOT EXISTS leased_until TIMESTAMPTZ;
 
--- Both or neither. A lease with no expiry would hold a row forever, and an expiry with no
--- identifier could not be fenced.
-ALTER TABLE platform.outbox
-    DROP CONSTRAINT IF EXISTS outbox_lease_complete;
+        -- Both or neither. A lease with no expiry would hold a row forever, and an expiry with
+        -- no identifier could not be fenced.
+        ALTER TABLE platform.outbox
+            DROP CONSTRAINT IF EXISTS outbox_lease_complete;
 
-ALTER TABLE platform.outbox
-    ADD CONSTRAINT outbox_lease_complete CHECK ((lease_id IS NULL) = (leased_until IS NULL));
+        ALTER TABLE platform.outbox
+            ADD CONSTRAINT outbox_lease_complete CHECK ((lease_id IS NULL) = (leased_until IS NULL));
+    END IF;
+END
+$$;

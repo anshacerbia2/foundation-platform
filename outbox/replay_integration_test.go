@@ -53,6 +53,11 @@ func dropOutboxRow(ctx context.Context, t *testing.T, p *db.Pool, eventID string
 	t.Helper()
 
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		// Its deliveries go with it, as retention drops a day's delivery partition with the
+		// event's.
+		if _, err := tx.Exec(ctx, "DELETE FROM platform.outbox_delivery WHERE event_id = $1", eventID); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, "DELETE FROM platform.outbox WHERE event_id = $1", eventID)
 		return err
 	}); err != nil {
@@ -144,7 +149,8 @@ func TestADeadLetterCanBeReplayedAfterTheOriginalIsGone(t *testing.T) {
 		t.Fatalf("the retained aggregate_id does not parse: %v", err)
 	}
 
-	var opts []Option
+	// To the consumer that refused it (ADR-GLB-018 §5.3), not to every subscriber.
+	opts := []Option{To(subscriber)}
 	if *r.priority == PriorityHigh {
 		opts = append(opts, Priority())
 	}

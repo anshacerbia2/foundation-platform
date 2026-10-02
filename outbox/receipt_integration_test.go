@@ -69,6 +69,7 @@ func TestAConsumerMarkerRecordsAppliedEvidence(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
+	subscribed(ctx, t, p, "reference-projection")
 	clearReceipts(ctx, t, p)
 
 	e, _ := appendOne(ctx, t, p)
@@ -101,6 +102,7 @@ func TestNoMarkerRecordsTransportEvidenceOnly(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
+	subscribed(ctx, t, p, "broker")
 	clearReceipts(ctx, t, p)
 
 	e, _ := appendOne(ctx, t, p)
@@ -154,6 +156,7 @@ func TestAFailedPublicationLeavesNoReceipt(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
+	subscribed(ctx, t, p, "reference-projection")
 	clearReceipts(ctx, t, p)
 
 	e, _ := appendOne(ctx, t, p)
@@ -184,6 +187,7 @@ func TestADeadLetterNamesTheConsumerThatRefusedIt(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
+	subscribed(ctx, t, p, "reference-projection")
 
 	e, _ := appendOne(ctx, t, p)
 	pub := &fakePublisher{err: fmt.Errorf("refused: %w", ErrPoison)}
@@ -213,6 +217,7 @@ func TestAReplayDoesNotWeakenAnExistingReceipt(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
 	clearOutbox(ctx, t, p)
+	subscribed(ctx, t, p, "reference-projection")
 	clearReceipts(ctx, t, p)
 
 	e, aggregate := appendOne(ctx, t, p)

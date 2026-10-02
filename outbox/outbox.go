@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/anshacerbia2/foundation-platform/db"
 	"github.com/anshacerbia2/foundation-platform/event"
@@ -45,6 +46,11 @@ var (
 	// subject cannot be triaged from a dead-letter row, which is the moment it is most
 	// needed.
 	ErrNoAggregate = errors.New("outbox: an aggregate identifier is required")
+
+	// ErrNotSubscribed reports an append with To whose consumer has no active subscription to
+	// the event's type. The event would commit owed to nobody, and a replay that delivers
+	// nothing must not look like one that succeeded. The caller's transaction should roll back.
+	ErrNotSubscribed = errors.New("outbox: the consumer does not subscribe to this event type")
 )
 
 // appendOptions is the resolved set of options for one append. Named apart from Config,
@@ -52,6 +58,10 @@ var (
 // process, and a reader should not have to check which.
 type appendOptions struct {
 	priority int16
+
+	// only names the one consumer the event is owed to, for a replay; empty owes it to every
+	// subscriber.
+	only string
 }
 
 // Option adjusts how an event is appended.
@@ -67,20 +77,45 @@ func Priority() Option {
 	return func(o *appendOptions) { o.priority = PriorityHigh }
 }
 
-// appendStatement inserts one event.
+// To owes the event to one consumer alone, and only when that consumer subscribes to its type;
+// Append returns ErrNotSubscribed otherwise.
+//
+// It exists for a replay. A dead letter is one consumer's refusal (ADR-GLB-018 §5.3), and
+// replaying it to every subscriber would deliver again to consumers that applied it the first
+// time: they would discard it, at the cost of a delivery each.
+func To(consumer string) Option {
+	return func(o *appendOptions) { o.only = strings.TrimSpace(consumer) }
+}
+
+// subscriptionLock is the advisory lock key that orders appends against subscription changes
+// (TDD-foundation-platform-001 §Per-Consumer Delivery). Appends hold it shared and a
+// subscription change holds it exclusive, so no event commits without a delivery for a
+// subscription that committed before it, nor misses the snapshot of one that committed after.
+const subscriptionLock = `SELECT pg_advisory_xact_lock_shared(hashtextextended('platform.subscription', 0))`
+
+// appendStatement inserts one event and the delivery it owes each subscriber.
 //
 // One nextval supplies both the ordering column and the CloudEvents streamposition
 // extension. Keeping the assignment inside this statement makes the row and envelope
-// impossible to disagree. created_at, published, attempts, and last_error retain their
-// database defaults.
+// impossible to disagree. The deliveries take the event's created_at, sequence, type and lane
+// from the row as inserted, so a delivery cannot describe a different event, and they are
+// written in the same statement, so the event never exists without them (ADR-GLB-018 §5.2).
 const appendStatement = `WITH positioned AS (
 	SELECT nextval('platform.outbox_sequence')::bigint AS stream_position
+), inserted AS (
+	INSERT INTO platform.outbox
+		(event_id, sequence, event_type, aggregate_id, priority, payload, envelope)
+	SELECT $1, positioned.stream_position, $2, $3, $4, $5,
+		jsonb_set($6::jsonb, '{streamposition}', to_jsonb(positioned.stream_position), true)
+	FROM positioned
+	RETURNING created_at, event_id, sequence, event_type, priority
 )
-INSERT INTO platform.outbox
-	(event_id, sequence, event_type, aggregate_id, priority, payload, envelope)
-SELECT $1, positioned.stream_position, $2, $3, $4, $5,
-	jsonb_set($6::jsonb, '{streamposition}', to_jsonb(positioned.stream_position), true)
-FROM positioned`
+INSERT INTO platform.outbox_delivery (created_at, event_id, consumer, sequence, event_type, priority)
+SELECT i.created_at, i.event_id, s.consumer, i.sequence, i.event_type, i.priority
+FROM inserted i
+JOIN platform.subscription s
+  ON s.retired_at IS NULL AND i.event_type = ANY (s.event_types)
+ AND ($7 = '' OR s.consumer = $7)`
 
 // Append writes an event to the outbox inside the caller's transaction.
 //
@@ -127,15 +162,25 @@ func Append(ctx context.Context, tx db.Tx, aggregateID id.UUID, e event.Envelope
 	//
 	// Data is converted to a plain []byte so the driver plans it as JSON rather than
 	// reaching for the json.Marshaler that json.RawMessage also satisfies.
-	if _, err := tx.Exec(ctx, appendStatement,
+	if _, err := tx.Exec(ctx, subscriptionLock); err != nil {
+		return fmt.Errorf("outbox: ordering %s (%s) against subscription changes: %w", e.Type, e.ID, err)
+	}
+	tag, err := tx.Exec(ctx, appendStatement,
 		e.ID.String(),
 		string(e.Type),
 		aggregateID.String(),
 		resolved.priority,
 		[]byte(e.Data),
 		envelope,
-	); err != nil {
+		resolved.only,
+	)
+	if err != nil {
 		return fmt.Errorf("outbox: appending %s (%s): %w", e.Type, e.ID, err)
+	}
+	// The tag counts the deliveries, the statement's final INSERT. With no To, none is
+	// correct when nobody subscribes to the type (ADR-GLB-018 §5.1).
+	if resolved.only != "" && tag.RowsAffected() == 0 {
+		return fmt.Errorf("outbox: appending %s (%s) to %s: %w", e.Type, e.ID, resolved.only, ErrNotSubscribed)
 	}
 
 	return nil

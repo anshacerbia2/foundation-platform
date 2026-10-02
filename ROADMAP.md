@@ -272,6 +272,22 @@ Open, owned here:
   TDD-001 §Dispatch covers the full design. Recorded P1 in RESPONSE-15, RESPONSE-16 and
   RESPONSE-17. `organization-control` backlog item 11.
 
+## Week 5 · Per-consumer delivery
+
+Built for `ADR-GLB-018`, so `organization-control` can deliver its authority to more than one
+consumer: `foundation-reference`, and the Identity Control Service for provider grants and
+activations (`ADR-ORG-002 §5.3`). `TDD-001 §Per-Consumer Delivery` is the current statement.
+
+| Tag | Adds |
+| :-- | :-- |
+| `v0.3.0` | `platform.subscription` and `platform.outbox_delivery` (`0009`). `Append` writes one delivery per subscriber in the event's own transaction, under a shared advisory lock that `Subscribe` takes exclusive. The dispatcher claims `Config.Consumer`'s deliveries alone. A dead letter is keyed `(event_id, consumer)`. `To(consumer)` owes a replay to one consumer and returns `ErrNotSubscribed` when it would owe nobody. **Breaking**: the outbox loses its publication columns, `0001` and `0008` are guarded so the set stays re-runnable, and the dispatch role needs `SELECT, UPDATE` on `platform.outbox_delivery` and only `SELECT` on `platform.outbox`. Drain the outbox before applying `0009`: an unpublished event has no delivery afterwards |
+
+Consequences for consumers, owned by them:
+
+- `organization-control` subscribes each named consumer, drops `consumer_single_active`, and reads
+  frontier, debt, replay and closure per consumer from `platform.outbox_delivery`.
+- A host that owns a dispatcher runs one per consumer, each with its own endpoint and credential.
+
 ## Decisions this repository does not make
 
 | Decision | Owner |

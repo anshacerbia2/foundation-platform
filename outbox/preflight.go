@@ -55,9 +55,16 @@ var dispatcherRequirements = []struct {
 }{
 	{
 		table:      "platform.outbox",
+		privileges: []string{"SELECT"},
+		because:    "claimStatement reads each claimed event's envelope; deadLetterStatement copies the event into the incident",
+	},
+	{
+		table:      "platform.outbox_delivery",
 		privileges: []string{"SELECT", "UPDATE"},
-		columns:    []string{"lease_id", "leased_until"},
-		because:    "claimStatement leases the batch; markPublished and recordFailure write the outcome back",
+		// The table arrived in migration 0009 (ADR-GLB-018). A database that stops short of it
+		// fails here, rather than on the first claim.
+		columns: []string{"consumer", "lease_id", "leased_until"},
+		because: "claimStatement leases this consumer's deliveries; markPublished and recordFailure write the outcome back",
 	},
 	{
 		table:      "platform.dead_letter",

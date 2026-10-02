@@ -55,6 +55,13 @@ func TestMain(m *testing.M) {
 		p.Close()
 		os.Exit(1)
 	}
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return Subscribe(ctx, tx, subscriber, []event.Type{event.MustParseType(testType)})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "subscribing %s: %v\n", subscriber, err)
+		p.Close()
+		os.Exit(1)
+	}
 
 	code := m.Run()
 	p.Close()
@@ -91,6 +98,28 @@ func resetSchema(ctx context.Context, p *db.Pool) error {
 	return nil
 }
 
+// subscriber is the consumer every test in this package is owed deliveries for, subscribed once
+// in TestMain. A test naming another consumer subscribes it with subscribed, before it appends.
+const subscriber = "test-consumer"
+
+// subscribed subscribes consumer to the test event type for the rest of the test, and retires the
+// subscription afterwards so later tests are not owed deliveries they never dispatch.
+func subscribed(ctx context.Context, t *testing.T, p *db.Pool, consumer string) {
+	t.Helper()
+	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		return Subscribe(ctx, tx, consumer, []event.Type{event.MustParseType(testType)})
+	}); err != nil {
+		t.Fatalf("subscribing %s: %v", consumer, err)
+	}
+	t.Cleanup(func() {
+		if err := p.InTx(context.Background(), func(ctx context.Context, tx db.Tx) error {
+			return Unsubscribe(ctx, tx, consumer)
+		}); err != nil {
+			t.Errorf("unsubscribing %s: %v", consumer, err)
+		}
+	})
+}
+
 func requireDatabase(t *testing.T) *db.Pool {
 	t.Helper()
 	if pool == nil {
@@ -99,7 +128,8 @@ func requireDatabase(t *testing.T) *db.Pool {
 	return pool
 }
 
-// storedRow is the subset of platform.outbox these tests read back.
+// storedRow is the subset of platform.outbox these tests read back, with the publication state of
+// the subscriber's delivery.
 type storedRow struct {
 	eventID     string
 	eventType   string
@@ -117,18 +147,20 @@ func readRow(ctx context.Context, p *db.Pool, eventID string) (storedRow, error)
 	var r storedRow
 	err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT event_id::text,
-			       event_type,
-			       aggregate_id::text,
-			       priority,
-			       published,
-			       attempts,
-			       sequence,
-			       jsonb_typeof(payload),
-			       envelope ->> 'type',
-			       (envelope ->> 'streamposition')::bigint
-			FROM platform.outbox
-			WHERE event_id = $1`, eventID,
+			SELECT o.event_id::text,
+			       o.event_type,
+			       o.aggregate_id::text,
+			       o.priority,
+			       d.published,
+			       d.attempts,
+			       o.sequence,
+			       jsonb_typeof(o.payload),
+			       o.envelope ->> 'type',
+			       (o.envelope ->> 'streamposition')::bigint
+			FROM platform.outbox o
+			JOIN platform.outbox_delivery d
+			  ON d.created_at = o.created_at AND d.event_id = o.event_id AND d.consumer = $2
+			WHERE o.event_id = $1`, eventID, subscriber,
 		).Scan(&r.eventID, &r.eventType, &r.aggregateID, &r.priority,
 			&r.published, &r.attempts, &r.sequence, &r.payloadKind, &r.envelopeAt, &r.envelopePos)
 	})
@@ -267,7 +299,8 @@ func TestAFailureAfterAppendRollsTheEventBack(t *testing.T) {
 	var count int
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx,
-			"SELECT count(*) FROM platform.outbox WHERE event_id = $1", e.ID.String(),
+			`SELECT (SELECT count(*) FROM platform.outbox WHERE event_id = $1)
+			      + (SELECT count(*) FROM platform.outbox_delivery WHERE event_id = $1)`, e.ID.String(),
 		).Scan(&count)
 	}); err != nil {
 		t.Fatalf("counting rows: %v", err)
@@ -279,8 +312,8 @@ func TestAFailureAfterAppendRollsTheEventBack(t *testing.T) {
 }
 
 // The dispatcher's claim query depends on this index existing with this predicate. A
-// full scan of a partitioned outbox on every poll is the difference between the 1 s claim
-// budget and missing it.
+// full scan of a partitioned delivery table on every poll is the difference between the 1 s
+// claim budget and missing it.
 func TestTheUnpublishedIndexExists(t *testing.T) {
 	p := requireDatabase(t)
 	ctx := context.Background()
@@ -289,14 +322,14 @@ func TestTheUnpublishedIndexExists(t *testing.T) {
 	if err := p.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT indexdef FROM pg_indexes
-			WHERE schemaname = 'platform' AND indexname = 'outbox_unpublished'`,
+			WHERE schemaname = 'platform' AND indexname = 'outbox_delivery_unpublished'`,
 		).Scan(&definition)
 	}); err != nil {
-		t.Fatalf("outbox_unpublished is absent from the applied schema: %v", err)
+		t.Fatalf("outbox_delivery_unpublished is absent from the applied schema: %v", err)
 	}
 
 	lowered := strings.ToLower(definition)
-	for _, fragment := range []string{"priority", "sequence", "published = false"} {
+	for _, fragment := range []string{"consumer, priority, sequence", "published = false"} {
 		if !strings.Contains(lowered, fragment) {
 			t.Errorf("index definition %q omits %q", definition, fragment)
 		}
@@ -376,10 +409,14 @@ func TestPartitionRetentionKeepsUnpublishedRowsAndDropsPublishedOnes(t *testing.
 		if _, err := migrations.EnsureOutboxPartitions(ctx, tx, day, day); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO platform.outbox
-			(event_id, event_type, aggregate_id, payload, envelope, created_at)
+		_, err := tx.Exec(ctx, `WITH e AS (
+			INSERT INTO platform.outbox
+			    (event_id, event_type, aggregate_id, payload, envelope, created_at)
 			VALUES (gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
-			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1)`, day.Add(time.Hour))
+			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1)
+			RETURNING created_at, event_id, sequence, event_type, priority)
+			INSERT INTO platform.outbox_delivery (created_at, event_id, consumer, sequence, event_type, priority)
+			SELECT created_at, event_id, $2, sequence, event_type, priority FROM e`, day.Add(time.Hour), subscriber)
 		return err
 	}); err != nil {
 		t.Fatalf("preparing retained partition: %v", err)
@@ -393,7 +430,7 @@ func TestPartitionRetentionKeepsUnpublishedRowsAndDropsPublishedOnes(t *testing.
 		if len(dropped) != 0 {
 			t.Errorf("dropped partition with unpublished data: %v", dropped)
 		}
-		_, err = tx.Exec(ctx, `UPDATE platform.outbox SET published = TRUE
+		_, err = tx.Exec(ctx, `UPDATE platform.outbox_delivery SET published = TRUE
 			WHERE created_at >= $1 AND created_at < $2`, day, day.Add(24*time.Hour))
 		return err
 	}); err != nil {
@@ -426,9 +463,9 @@ func TestSequenceAdvancesAcrossPartitionBoundaries(t *testing.T) {
 			return err
 		}
 		statement := `INSERT INTO platform.outbox
-			(event_id, event_type, aggregate_id, payload, envelope, published, created_at)
+			(event_id, event_type, aggregate_id, payload, envelope, created_at)
 			VALUES (gen_random_uuid(), 'com.scnehaux.test.record.lifecycle.created',
-			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, TRUE, $1)
+			        gen_random_uuid(), '{}'::jsonb, '{}'::jsonb, $1)
 			RETURNING sequence`
 		if err := tx.QueryRow(ctx, statement, firstDay.Add(time.Hour)).Scan(&firstSequence); err != nil {
 			return err
