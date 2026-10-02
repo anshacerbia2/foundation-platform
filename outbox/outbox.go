@@ -97,25 +97,33 @@ const subscriptionLock = `SELECT pg_advisory_xact_lock_shared(hashtextextended('
 //
 // One nextval supplies both the ordering column and the CloudEvents streamposition
 // extension. Keeping the assignment inside this statement makes the row and envelope
-// impossible to disagree. The deliveries take the event's created_at, sequence, type and lane
-// from the row as inserted, so a delivery cannot describe a different event, and they are
-// written in the same statement, so the event never exists without them (ADR-GLB-018 §5.2).
+// impossible to disagree.
+//
+// The creation instant and the position are computed once, in positioned, and written into the
+// event and every delivery it owes, so a delivery cannot describe a different event and lands in
+// its event's day partition. The deliveries are written in the same statement, so the event never
+// exists without them (ADR-GLB-018 §5.2).
+//
+// Nothing reads the inserted row back. RETURNING requires SELECT on the columns it names, which
+// would let every role that publishes read the outbox (ADR-GLB-018 §5.6). The statement reads the
+// active subscriptions alone, so an appending role holds INSERT on platform.outbox and
+// platform.outbox_delivery, SELECT on three columns of platform.subscription, and USAGE on the
+// sequence. A data-modifying CTE runs to completion whether or not the outer statement reads it.
 const appendStatement = `WITH positioned AS (
-	SELECT nextval('platform.outbox_sequence')::bigint AS stream_position
+	SELECT nextval('platform.outbox_sequence')::bigint AS stream_position, now() AS created_at
 ), inserted AS (
 	INSERT INTO platform.outbox
-		(event_id, sequence, event_type, aggregate_id, priority, payload, envelope)
-	SELECT $1, positioned.stream_position, $2, $3, $4, $5,
+		(created_at, event_id, sequence, event_type, aggregate_id, priority, payload, envelope)
+	SELECT positioned.created_at, $1::uuid, positioned.stream_position, $2::text, $3::uuid, $4::smallint, $5,
 		jsonb_set($6::jsonb, '{streamposition}', to_jsonb(positioned.stream_position), true)
 	FROM positioned
-	RETURNING created_at, event_id, sequence, event_type, priority
 )
 INSERT INTO platform.outbox_delivery (created_at, event_id, consumer, sequence, event_type, priority)
-SELECT i.created_at, i.event_id, s.consumer, i.sequence, i.event_type, i.priority
-FROM inserted i
+SELECT positioned.created_at, $1::uuid, s.consumer, positioned.stream_position, $2::text, $4::smallint
+FROM positioned
 JOIN platform.subscription s
-  ON s.retired_at IS NULL AND i.event_type = ANY (s.event_types)
- AND ($7 = '' OR s.consumer = $7)`
+  ON s.retired_at IS NULL AND $2::text = ANY (s.event_types)
+ AND ($7::text = '' OR s.consumer = $7::text)`
 
 // Append writes an event to the outbox inside the caller's transaction.
 //

@@ -120,6 +120,10 @@ const (
 
 	// FailureUnavailable is a failure that a later attempt may not see.
 	FailureUnavailable FailureClass = "unavailable"
+
+	// FailureAbandoned closes a delivery owed to a consumer that was retired, which nothing will
+	// ever deliver (ADR-GLB-018 §5.5). It is written by Abandon, never by the dispatcher.
+	FailureAbandoned FailureClass = "abandoned"
 )
 
 // classify reads a publication error.

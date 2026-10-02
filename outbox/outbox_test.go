@@ -300,8 +300,8 @@ func TestAppendOwesADeliveryToEachSubscriber(t *testing.T) {
 		"INSERT INTO platform.outbox_delivery",
 		"JOIN platform.subscription s",
 		"s.retired_at IS NULL",
-		"i.event_type = ANY (s.event_types)",
-		"$7 = '' OR s.consumer = $7",
+		"$2::text = ANY (s.event_types)",
+		"$7::text = '' OR s.consumer = $7::text",
 	} {
 		if !strings.Contains(appendStatement, fragment) {
 			t.Errorf("append statement omits %q:\n%s", fragment, appendStatement)
@@ -345,5 +345,13 @@ func TestAnEventNobodySubscribesToIsStillAppended(t *testing.T) {
 	tx := &dbtest.Tx{Tag: dbtest.CommandTag(0)}
 	if err := Append(context.Background(), tx, newAggregateID(t), newEnvelope(t)); err != nil {
 		t.Fatalf("Append: %v", err)
+	}
+}
+
+// ADR-GLB-018 §5.6: RETURNING needs SELECT on what it returns, and the roles that publish hold no
+// read of the outbox.
+func TestAppendReadsNothingBackFromTheOutbox(t *testing.T) {
+	if strings.Contains(strings.ToUpper(appendStatement), "RETURNING") {
+		t.Fatalf("append reads the inserted row back, which needs SELECT on platform.outbox:\n%s", appendStatement)
 	}
 }

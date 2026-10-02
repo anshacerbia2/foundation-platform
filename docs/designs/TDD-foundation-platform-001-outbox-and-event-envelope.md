@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.0.0
+  version: 2.1.0
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -304,6 +304,33 @@ the first time. They would discard the replay, at the cost of a delivery each. A
 no delivery returns `ErrNotSubscribed`, so the caller's transaction rolls back rather than
 committing an event owed to nobody: a replay that delivered nothing must not read as one that
 succeeded.
+
+**A retired consumer's deliveries are abandoned.** `Abandon(tx, consumer, reason)` closes every
+delivery still owed to a consumer with no active subscription. Each is marked published with
+`failure_class = 'abandoned'` and the reason, with no `published_at` and no receipt. Call it in
+the transaction that retires the consumer, after `Unsubscribe`. It takes the subscription lock
+exclusive and refuses with `ErrStillSubscribed` while the consumer subscribes, so a consumer that
+is still enforcing never has a delivery it is owed abandoned (`ADR-GLB-018 §5.5`).
+
+- **Why.** Nothing delivers to a retired consumer, so its deliveries would stay owed and
+  `drop_outbox_partitions` would keep every day they belong to.
+- **What it is not.** An abandoned delivery is neither evidence nor debt. It is not a dead letter,
+  and no closure can cite it.
+- **The tradeoff.** A consumer retired by mistake loses its backlog and bootstraps again, as a
+  Pub/Sub subscription created under a deleted one's name "would have no backlog" (`ADR-GLB-018`
+  [R5]).
+
+**Appending reads no outbox row.** The append computes the creation instant and the position once
+and writes both into the event and every delivery, rather than reading the inserted row back.
+`RETURNING` requires `SELECT` on the columns it names (`ADR-GLB-018` [R6]), and that would give
+every role that publishes a read of the outbox. v0.3.0 read the row back, and v0.3.1 does not. An
+appending role holds:
+
+- `INSERT` on `platform.outbox` and `platform.outbox_delivery`;
+- `SELECT (consumer, event_types, retired_at)` on `platform.subscription`;
+- `USAGE` on `platform.outbox_sequence`.
+
+`TestARoleThatOnlyPublishesCanAppend` measures it with a role holding exactly that.
 
 **The dispatch role's grants.** `SELECT, UPDATE` on `platform.outbox_delivery`, `SELECT` on
 `platform.outbox` for the envelope, and `INSERT, SELECT` on `platform.dead_letter` and
@@ -625,6 +652,10 @@ func To(consumer string) Option
 func Subscribe(ctx context.Context, tx db.Tx, consumer string, eventTypes []event.Type) error
 func Unsubscribe(ctx context.Context, tx db.Tx, consumer string) error
 
+// Abandon closes the deliveries still owed to a consumer that no longer subscribes, and reports
+// how many. ErrStillSubscribed while it subscribes.
+func Abandon(ctx context.Context, tx db.Tx, consumer, reason string) (int64, error)
+
 // Publisher is the host's delivery adapter. Wrapping ErrPoison marks a permanent refusal;
 // any other error is unavailability.
 type Publisher interface {
@@ -941,6 +972,10 @@ The host also supplies the maintenance boundaries. This design's values are:
 - `To` owes a replay to one consumer and refuses one owed to nobody. A replaced subscription owes
   only its new types, and a retired one owes nothing new.
 - A subscription waits for an append in flight; that event is not owed to it, and the next one is.
+- A retired consumer's deliveries are abandoned and nobody else's. Abandoning refuses a consumer
+  that still subscribes. An abandoned delivery reads as undelivered, carries no receipt, and does
+  not hold retention.
+- A role holding only what publishing needs can append, and cannot read the outbox.
 - A delivery lands in its event's day partition. Re-applying the migration set leaves
   `platform.outbox` with no publication columns and `platform.dead_letter` with no primary key.
 - A dead letter names the consumer that refused it.

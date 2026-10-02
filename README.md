@@ -191,7 +191,9 @@ err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 A subscription is replaced, never edited. Events committed before it are not owed to the
 consumer, which starts from the producer's snapshot instead. A replay of one consumer's dead
 letter uses `outbox.To(consumer)`, so the consumers that applied the event the first time are
-not sent it again.
+not sent it again. Retiring a consumer is `outbox.Unsubscribe` and then `outbox.Abandon` in one
+transaction: what it was still owed is closed as abandoned, because nothing will deliver it and
+retention would otherwise keep every day it belongs to.
 
 `broker` is anything satisfying `outbox.Publisher`. This module holds no broker client: the
 interface is declared here because this package is what needs it, and the adapter that
