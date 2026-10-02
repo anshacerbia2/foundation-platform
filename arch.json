@@ -24,7 +24,9 @@
     "httpapi": ["id", "observability", "redact"],
     "observability": ["id", "redact"],
     "redact": [],
-    "verify": []
+    "verify": [],
+    "clientauth": [],
+    "outbox/httpdelivery": ["event", "observability", "outbox"]
   },
 
   "pureSegments": ["domain"],
