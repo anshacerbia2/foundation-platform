@@ -22,6 +22,21 @@
 // The consequence is worth stating plainly: this package alone does not satisfy STD-IAM-002
 // §3.5. A consumer that supplies no requirement gets signature, issuer, audience, and expiry
 // checking and nothing else, so Config refuses to build without one.
+//
+// # Step 8 is the resource's, after this package
+//
+// STD-IAM-002 §3.5 step 8 (1.6.0) rejects a token carrying tenant_id unless the resource's own
+// projection holds the Principal's Membership in that Tenant as active and the Tenant as active. It
+// cannot live here, for two reasons this package is built on: it names tenant_id, a claim this
+// module may not know, and it reads the resource's own records for each request, which a verifier
+// deciding from signing material and claims alone does not hold. A ClaimRequirement cannot make it
+// either, because it sees claims and nothing else.
+//
+// So a resource makes it after Verify, against what it holds: organization-control against its own
+// Membership and Tenant records (ADR-ORG-003 §5.3), foundation-reference against its projection,
+// and identity-control by refusing tenant_id outright, because none of its operations belongs to a
+// Tenant. A resource that accepts tenant_id and holds no projection of that Tenant's Memberships
+// cannot make the check, and must refuse the token.
 package verify
 
 import (
