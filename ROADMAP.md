@@ -23,7 +23,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
-| `verify` | **done** | Local token verification: JWKS caching with rate-limited refetch, `PS256` only, exact issuer, audience, bounded skew, and a mandatory consumer claim rule; 90.2% coverage |
+| `verify` | **done** | Local token verification: JWKS caching with rate-limited refetch, `PS256` only, exact issuer, audience, bounded skew, and a mandatory consumer claim rule; 90.2% coverage. STD-IAM-002 §3.5 step 8, the current-state check, is the resource's, after `Verify`: it names `tenant_id` and reads the resource's own records, neither of which this module may do (package doc) |
 
 `arch.json` already declares the internal edges for every package above, so an
 accidental coupling introduced while writing them fails the build rather than
