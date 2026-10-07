@@ -19,7 +19,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `outbox` | **done** | Append, two-lane dispatcher, retry/dead letter, persisted-error redaction, retention helpers, and 10,000-row priority proof |
 | `inbox` | **done** | Transactional composite-key guard over `(event_id, consumer)`; 100% unit coverage |
 | `idempotency` | **done** | Caller-scoped claim, digest conflict, in-progress state, completion, and stored-response replay |
-| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and a closed RFC 9457 registry of twelve types |
+| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and a closed RFC 9457 registry of fourteen types |
 | `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
@@ -286,6 +286,8 @@ activations (`ADR-ORG-002 §5.3`). `TDD-001 §Per-Consumer Delivery` is the curr
 
 | `v0.4.0` | `clientauth`: the client credentials grant with a `private_key_jwt` assertion (RFC 6749 §4.4, RFC 7523), a cached token, and `Invalidate` for a 401. `outbox/httpdelivery`: the Direct Durable Delivery publisher, moved from foundation-reference, now taking a `TokenSource`, so a producer's dispatcher authenticates as its workload (ADR-GLB-018 §5.4, STD-IAM-001 §3). A 401 drops the cached token and retries. `StaticToken` is kept for a local proof |
 
+| `v0.4.1` | `httpapi.PayloadTooLarge`, `https://problems.scnehaux.com/payload-too-large`, 413: a well-formed request over a declared limit, which RFC 7644 §3.7.4 requires for a bulk request and which `organization-control`'s Membership batch was answering as `validation-failed` (TDD-002 §Problem Type Registry). `0010` indexes `platform.outbox_delivery (event_id)`, so one event's deliveries are read without scanning every partition (TDD-001 §Per-Consumer Delivery). No grant changes. The index build blocks writes to `platform.outbox_delivery` while it runs |
+
 Consequences for consumers, owned by them:
 
 - `organization-control` subscribes each named consumer, drops `consumer_single_active`, and reads
@@ -381,3 +383,16 @@ The registry is closed and compiled precisely so a handler cannot invent a type,
 constraint and is also why the gap had to be closed here rather than worked around downstream.
 `TestEveryProblemTypeIsRegistered` now walks the constant range against the map, so a constant
 added without an entry fails rather than reaching a caller as an empty document with a zero status.
+
+### `payload-too-large` added to the problem registry
+
+`organization-control` was answering a Membership batch over its 500-item limit with
+`validation-failed`, a 400, because the registry offered nothing closer. RFC 7644 §3.7.4 is not
+optional about it: "If either limit is exceeded, the service provider MUST return HTTP response
+code 413 (Payload Too Large)."
+
+The two statuses carry different advice. A 400 says the request is wrong and sending it again in
+any shape will not help; a 413 says it is well formed and too large, and splitting it will. The
+type is declared in status order, between `precondition-unmet` and `rate-limited`, so the numeric
+values of the constants after it moved. Nothing serializes those values: a document carries the
+URI, and consumers refer to the constants by name.

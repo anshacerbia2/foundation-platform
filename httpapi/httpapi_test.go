@@ -236,3 +236,35 @@ func TestRequestInProgressIsDistinctFromStateTransitionRefused(t *testing.T) {
 		t.Errorf("status differs: %d and %d; both are conflicts", inProgress.Status, refused.Status)
 	}
 }
+
+// TestPayloadTooLargeAnswers413 states why the type was added.
+//
+// A batch over its declared limit was answered as validation-failed, a 400, because nothing better
+// existed. RFC 7644 §3.7.4 requires 413 for a SCIM bulk request over either limit, and RFC 9110
+// §15.5.14 defines 413 as content larger than the server is willing to process: a well-formed
+// request the client can split and send again, which a 400 does not tell it.
+func TestPayloadTooLargeAnswers413(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/memberships:batch", nil)
+	response := httptest.NewRecorder()
+
+	Problem(response, request, PayloadTooLarge, "A batch carries at most 500 items; this one carries 501.")
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", response.Code)
+	}
+	var document ProblemDocument
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatalf("problem JSON: %v", err)
+	}
+	if document.Type != "https://problems.scnehaux.com/payload-too-large" || document.Status != http.StatusRequestEntityTooLarge {
+		t.Errorf("problem = %+v", document)
+	}
+	if !strings.Contains(document.Detail, "500") {
+		t.Errorf("detail %q does not name the limit, which RFC 7644 §3.7.4 requires", document.Detail)
+	}
+
+	tooLarge := problemRegistry[PayloadTooLarge]
+	invalid := problemRegistry[ValidationFailed]
+	if tooLarge.URI == invalid.URI || tooLarge.Status == invalid.Status {
+		t.Errorf("payload-too-large is indistinguishable from validation-failed: %+v and %+v", tooLarge, invalid)
+	}
+}

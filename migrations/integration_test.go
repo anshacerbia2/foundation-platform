@@ -182,6 +182,51 @@ func TestRepeatedApplicationLeavesTheSchemaCorrect(t *testing.T) {
 	})
 }
 
+// TestOutboxDeliveryIsIndexedByEvent states that a read of one event's deliveries is served by an
+// index, on the parent and on a day partition created after the index was.
+//
+// A partition built by ensure_outbox_partitions starts as a LIKE copy, which carries no index, and
+// gains this one only when it is attached. Asserting the parent alone would pass while every new
+// day was scanned in full.
+func TestOutboxDeliveryIsIndexedByEvent(t *testing.T) {
+	onCleanSchema(t, func(ctx context.Context, tx db.Tx) {
+		for i := 0; i < 2; i++ {
+			if err := applyAll(ctx, tx); err != nil {
+				t.Fatalf("applying the migration set: %v", err)
+			}
+		}
+
+		// Indexes on the relation whose first key column is event_id. On the parent that is
+		// outbox_delivery_event alone: the primary key leads with created_at.
+		const leadingEventID = `
+			SELECT count(*)
+			  FROM pg_index i
+			  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+			 WHERE i.indrelid = $1::regclass AND a.attname = 'event_id'`
+
+		if n := scanOne[int](ctx, t, tx, leadingEventID, "platform.outbox_delivery"); n != 1 {
+			t.Errorf("platform.outbox_delivery has %d indexes leading with event_id, want 1", n)
+		}
+		named := scanOne[int](ctx, t, tx,
+			`SELECT count(*) FROM pg_indexes WHERE schemaname = 'platform' AND indexname = 'outbox_delivery_event'`)
+		if named != 1 {
+			t.Errorf("outbox_delivery_event exists %d times, want 1", named)
+		}
+
+		created := scanOne[int](ctx, t, tx,
+			`SELECT count(*) FROM platform.ensure_outbox_partitions(DATE '2031-01-01', DATE '2031-01-01')`)
+		if created != 1 {
+			t.Fatalf("ensure_outbox_partitions returned %d partitions, want 1", created)
+		}
+		if n := scanOne[int](ctx, t, tx, leadingEventID, "platform.outbox_delivery_20310101"); n != 1 {
+			t.Errorf("a day partition created after 0010 has %d indexes leading with event_id, want 1", n)
+		}
+		if n := scanOne[int](ctx, t, tx, leadingEventID, "platform.outbox_delivery_default"); n != 1 {
+			t.Errorf("the default partition has %d indexes leading with event_id, want 1", n)
+		}
+	})
+}
+
 // scanOne reads a single value. A failure is fatal: every query here is a schema assertion, and a
 // query that could not run says nothing about the schema either way.
 func scanOne[T any](ctx context.Context, t *testing.T, tx db.Tx, sql string, args ...any) T {

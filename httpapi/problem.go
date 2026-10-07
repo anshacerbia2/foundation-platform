@@ -30,6 +30,18 @@ const (
 	// should wait.
 	RequestInProgress
 	PreconditionUnmet
+
+	// PayloadTooLarge is a request whose content exceeds a limit the service declares, such as
+	// the number of items a batch may carry.
+	//
+	// Distinct from ValidationFailed, which consumers were using for it because nothing better
+	// existed. A 400 says the request is malformed; a 413 says it is well formed and larger than
+	// the service will process, so the client can split it and send it again. SCIM requires the
+	// distinction for a bulk request: "If either limit is exceeded, the service provider MUST
+	// return HTTP response code 413 (Payload Too Large). The returned response MUST specify the
+	// limit exceeded in the body of the error response" (RFC 7644 §3.7.4). The detail therefore
+	// names the limit.
+	PayloadTooLarge
 	RateLimited
 	Overloaded
 	DependencyUnavailable
@@ -52,6 +64,7 @@ var problemRegistry = map[ProblemType]problemDefinition{
 	StateTransitionRefused: {"https://problems.scnehaux.com/state-transition-refused", "The requested state transition was refused", http.StatusConflict},
 	RequestInProgress:      {"https://problems.scnehaux.com/request-in-progress", "An identical request is still in progress", http.StatusConflict},
 	PreconditionUnmet:      {"https://problems.scnehaux.com/precondition-unmet", "A request precondition was not met", http.StatusPreconditionFailed},
+	PayloadTooLarge:        {"https://problems.scnehaux.com/payload-too-large", "The request content is too large", http.StatusRequestEntityTooLarge},
 	RateLimited:            {"https://problems.scnehaux.com/rate-limited", "The request rate is too high", http.StatusTooManyRequests},
 	Overloaded:             {"https://problems.scnehaux.com/overloaded", "The service is overloaded", http.StatusServiceUnavailable},
 	DependencyUnavailable:  {"https://problems.scnehaux.com/dependency-unavailable", "A required dependency is unavailable", http.StatusServiceUnavailable},
