@@ -1,0 +1,24 @@
+-- The deliveries of one event (TDD-foundation-platform-001 §Per-Consumer Delivery).
+--
+-- A host reads every delivery an event was owed by its identifier alone: organization-control's
+-- enforcement report finds a Membership's latest event and asks each consumer's delivery for its
+-- evidence. Neither existing index serves that. The primary key leads with created_at and
+-- outbox_delivery_unpublished with consumer, and PostgreSQL uses a B-tree most efficiently "when
+-- there are constraints on the leading (leftmost) columns" (PostgreSQL 17 §11.3). Without this,
+-- the read scans every partition the outbox retains.
+--
+-- On the partitioned parent, so it recurses: "When CREATE INDEX is invoked on a partitioned table,
+-- the default behavior is to recurse to all partitions to ensure they all have matching indexes"
+-- (PostgreSQL 17, CREATE INDEX). A day partition created later by ensure_outbox_partitions is
+-- built with LIKE, which copies no index, and receives this one when it is attached: "For each
+-- index in the target table, if a valid equivalent index already exists in the partition, it will
+-- be attached to the target table's index ...; otherwise, a new corresponding index will be
+-- created" (PostgreSQL 17, ALTER TABLE ... ATTACH PARTITION).
+--
+-- Not CONCURRENTLY: "Concurrent builds for indexes on partitioned tables are currently not
+-- supported." The build holds writes to platform.outbox_delivery for its duration, which on an
+-- estate with history means a deployment window. No production estate exists.
+--
+-- IF NOT EXISTS, because the set is applied whole on every deployment.
+CREATE INDEX IF NOT EXISTS outbox_delivery_event
+    ON platform.outbox_delivery (event_id);

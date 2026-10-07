@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-002
   title: HTTP Substrate, Persistence, and Telemetry
   owner: Core Platform Team
-  version: 1.3.0
+  version: 1.4.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-11
-  last_reviewed: 2026-09-28
+  last_reviewed: 2026-10-07
   parent_sad:
     - SAD-001
     - SAD-004
@@ -215,7 +215,9 @@ https://problems.scnehaux.com/not-found                     404
 https://problems.scnehaux.com/version-conflict              409
 https://problems.scnehaux.com/idempotency-key-conflict      409
 https://problems.scnehaux.com/state-transition-refused      409
+https://problems.scnehaux.com/request-in-progress           409
 https://problems.scnehaux.com/precondition-unmet            412
+https://problems.scnehaux.com/payload-too-large             413
 https://problems.scnehaux.com/rate-limited                  429
 https://problems.scnehaux.com/overloaded                    503
 https://problems.scnehaux.com/dependency-unavailable        503
@@ -224,6 +226,23 @@ https://problems.scnehaux.com/internal                      500
 
 A registry rather than free-form strings, because a client that cannot enumerate the
 error space pattern-matches on `detail` text, and `detail` is prose that changes.
+
+**`payload-too-large` is not `validation-failed`.** A request that is well formed and larger than
+a limit the service declares, such as the number of items one batch may carry, is answered 413.
+HTTP defines the status as a refusal "because the request content is larger than the server is
+willing or able to process" (RFC 9110 §15.5.14 [R3]), which a client can act on by splitting the
+request and sending it again. A 400 says the request itself is wrong, and splitting it would not
+help. SCIM makes the distinction mandatory for a bulk request: "If either limit is exceeded, the
+service provider MUST return HTTP response code 413 (Payload Too Large). The returned response
+MUST specify the limit exceeded in the body of the error response" (RFC 7644 §3.7.4 [R4]). The
+`detail` therefore names the limit, for example `A batch carries at most 500 items`. The URI keeps
+RFC 7644's name for the status; RFC 9110 later renamed it Content Too Large, and the code is the
+same.
+
+| Ref | Source |
+| :-- | :-- |
+| R3 | IETF, *RFC 9110 HTTP Semantics*, §15.5.14 413 Content Too Large, <https://www.rfc-editor.org/rfc/rfc9110#section-15.5.14>, accessed 2026-10-07 |
+| R4 | IETF, *RFC 7644 System for Cross-domain Identity Management: Protocol*, §3.7.4 Maximum Operations, <https://www.rfc-editor.org/rfc/rfc7644#section-3.7.4>, accessed 2026-10-07 |
 
 ```json
 {
@@ -370,6 +389,9 @@ directly; the composition root constructs and injects it.
 
 - Every error response validates against RFC 7807.
 - Every `type` resolves to a registry entry; an unregistered type fails to compile.
+- Every declared constant has a complete registry entry (`TestEveryProblemTypeIsRegistered`).
+- `payload-too-large` answers 413 with a `detail` naming the limit, and is distinguishable from
+  `validation-failed` (`TestPayloadTooLargeAnswers413`).
 - No response body, at any status, contains a token, credential, key, or cookie value,
   asserted by fuzzing handler errors with credential-shaped input.
 - A `detail` string never echoes a request body value.

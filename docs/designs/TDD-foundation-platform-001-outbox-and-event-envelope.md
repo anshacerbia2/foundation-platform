@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.2.0
+  version: 2.3.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-10-02
+  last_reviewed: 2026-10-07
   parent_sad:
     - SAD-001
     - SAD-004
@@ -270,7 +270,37 @@ CREATE TABLE platform.outbox_delivery (
 ) PARTITION BY RANGE (created_at);
 CREATE INDEX outbox_delivery_unpublished
     ON platform.outbox_delivery (consumer, priority, sequence) WHERE published = FALSE;
+CREATE INDEX outbox_delivery_event ON platform.outbox_delivery (event_id);  -- 0010
 ```
+
+**One event's deliveries are found by its identifier.** A host reads every delivery an event was
+owed knowing only the event: `organization-control`'s enforcement report finds a Membership's
+latest event and reads each consumer's delivery for its evidence. The primary key leads with
+`created_at` and `outbox_delivery_unpublished` with `consumer`, and a B-tree "is most efficient
+when there are constraints on the leading (leftmost) columns" (PostgreSQL 17 §11.3 [R7]), so
+without `outbox_delivery_event` that read scans every retained partition. The dispatcher's own
+statements name `created_at` and are served by the primary key.
+
+- **It reaches every partition.** Created on the parent, it recurses: "When CREATE INDEX is
+  invoked on a partitioned table, the default behavior is to recurse to all partitions to ensure
+  they all have matching indexes" ([R8]). A day built later by `ensure_outbox_partitions` is a
+  `LIKE` copy with no index, and gains this one when attached: "if a valid equivalent index
+  already exists in the partition, it will be attached to the target table's index ...;
+  otherwise, a new corresponding index will be created" ([R9]).
+  `TestOutboxDeliveryIsIndexedByEvent` asserts the parent, the default partition and a day
+  created after `0010`.
+- **The tradeoff.** "Concurrent builds for indexes on partitioned tables are currently not
+  supported" ([R8]), so the build blocks writes to `platform.outbox_delivery` while it runs. Each
+  append also maintains one more index. No production estate exists; on one with history the
+  build belongs in a deployment window.
+
+R7–R9 are this design's own; the bracketed references naming `ADR-GLB-018` are that ADR's.
+
+| Ref | Source |
+| :-- | :-- |
+| R7 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, §11.3 Multicolumn Indexes, <https://www.postgresql.org/docs/17/indexes-multicolumn.html>, accessed 2026-10-07 |
+| R8 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, CREATE INDEX, <https://www.postgresql.org/docs/17/sql-createindex.html>, accessed 2026-10-07 |
+| R9 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, ALTER TABLE, ATTACH PARTITION, <https://www.postgresql.org/docs/17/sql-altertable.html>, accessed 2026-10-07 |
 
 **A subscription is replaced, not edited.** `Subscribe(tx, consumer, types)` retires the
 consumer's active subscription and records the new one. No runtime role updates `event_types`,
