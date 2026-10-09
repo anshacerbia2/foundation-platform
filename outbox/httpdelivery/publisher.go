@@ -153,8 +153,8 @@ func (p *Publisher) Publish(ctx context.Context, envelope event.Envelope) (outbo
 	// The correlation identifier travels with the delivery, so the producer's log line, this
 	// publication, and the consumer's refusal all join on one value. Without it the end-to-end
 	// delay is two stopwatches nobody can reconcile.
-	if correlation, ok := observability.CorrelationID(ctx); ok {
-		request.Header.Set("X-Correlation-Id", correlation.String())
+	if correlation, ok := correlationOf(ctx, envelope); ok {
+		request.Header.Set("X-Correlation-Id", correlation)
 	}
 
 	response, err := p.client.Do(request)
@@ -192,4 +192,34 @@ func (p *Publisher) Publish(ctx context.Context, envelope event.Envelope) (outbo
 		return outbox.Receipt{}, fmt.Errorf("httpdelivery: the consumer answered %d for %s: %s",
 			response.StatusCode, envelope.ID, trimmed)
 	}
+}
+
+// correlationOf names the correlation identifier a delivery carries (TDD-foundation-platform-001
+// §HTTP Delivery).
+//
+// The context's wins when it carries one: it is the caller's explicit statement about this
+// publication, such as a replay run under an operator's incident correlation, and it was the only
+// source before the envelope's was read, so a caller that already sets one sees no change.
+//
+// Otherwise the envelope's data.correlation_id, where observability.Metadata puts it. The
+// dispatcher publishes on its own context, which carries none, so without this fallback a
+// dispatched delivery never carried the header at all.
+//
+// A payload that is not an object, or whose value is not a valid identifier, yields no header
+// rather than an error. The event is not at fault, and a malformed value must not reach a header.
+func correlationOf(ctx context.Context, envelope event.Envelope) (string, bool) {
+	if correlation, ok := observability.CorrelationID(ctx); ok {
+		return correlation.String(), true
+	}
+	var data struct {
+		CorrelationID json.RawMessage `json:"correlation_id"`
+	}
+	if len(envelope.Data) == 0 || json.Unmarshal(envelope.Data, &data) != nil || len(data.CorrelationID) == 0 {
+		return "", false
+	}
+	var metadata observability.Metadata
+	if json.Unmarshal(data.CorrelationID, &metadata.CorrelationID) != nil || metadata.CorrelationID.IsNil() {
+		return "", false
+	}
+	return metadata.CorrelationID.String(), true
 }

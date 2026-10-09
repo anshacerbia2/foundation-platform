@@ -215,15 +215,15 @@ response, the domain row, the outbox envelope, and the consumer span's `correlat
 Forcing the middleware to mint a fresh identifier, or dropping the identifier in
 `ContextWithMetadata`, turns it red.
 
-The identifier crosses the broker in the payload, not in a header. The dispatcher publishes
-on its own context, which carries no correlation, so the `X-Correlation-Id` header
-`httpdelivery` sets from the context is absent on every dispatched delivery. The test
-asserts the payload path for that reason.
+The identifier crosses the broker in the payload, where every consumer reads it. The test also
+asserts the delivery's `X-Correlation-Id` header.
 
-Open, owned here: `httpdelivery`'s comment says the header joins the producer's log line,
-the publication and the consumer's refusal, and under the dispatcher it never does. The fix
-is to set the header from the payload's `correlation_id` when the context carries none. It
-changes a shipped adapter, so it waits for a release the owner approves.
+- ✅ **A dispatched delivery carries `X-Correlation-Id`** (TDD-001 2.4.0 §HTTP Delivery). Writing
+  the test showed that it never did. The dispatcher publishes on its own context, which carries no
+  correlation, and `httpdelivery` read the context alone. It now falls back to the envelope's
+  `data.correlation_id`. The context still wins when it carries one, and a malformed value sends
+  no header and does not fail the delivery. The change is additive, with no API change.
+  **Unreleased:** consumers get it with the next patch tag, which needs the owner's approval.
 
 ## Week 3 · Hardening and release
 
@@ -359,7 +359,7 @@ A pull request adding any of these is rejected on principle, not on review prefe
 
 ## Gates
 
-✅ **Design gate.** Both designs are approved, `TDD-001` at `2.3.0` and `TDD-002` at
+✅ **Design gate.** Both designs are approved, `TDD-001` at `2.4.0` and `TDD-002` at
 `1.4.0`, and the broker adapter interface, `outbox.Publisher`, is fixed in TDD-001 §Go
 Surface.
 

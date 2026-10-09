@@ -16,12 +16,12 @@ package e2e
 // service: both HTTP ends are httptest servers and the database is created for this test and
 // dropped after it.
 //
-// The identifier crosses the broker inside the event payload, as observability.Metadata, and
-// that is the path asserted. The dispatcher publishes on its own context, which carries no
-// correlation, so the X-Correlation-Id header httpdelivery sets from the context is absent on a
-// dispatched delivery. The consumer therefore restores the identifier from the payload, which
-// is what every consumer has to do anyway: a broker other than this transport carries no
-// such header.
+// The identifier crosses the broker inside the event payload, as observability.Metadata, and the
+// consumer restores it from there, which is what every consumer has to do: a broker carries no
+// X-Correlation-Id header. This transport also sets that header, for the logs on both sides. The
+// dispatcher publishes on its own context, which carries no correlation, so httpdelivery takes the
+// value from the payload (TDD-foundation-platform-001 §HTTP Delivery), and the header is asserted
+// too.
 
 import (
 	"bytes"
@@ -92,6 +92,7 @@ func TestTheCorrelationIdentifierSurvivesFromRequestToConsumerSpan(t *testing.T)
 	// The consumer: restore the broker-carried metadata, open the consumer span, and apply the
 	// event behind its inbox guard, answering with the applied marker the way a real one does.
 	applied := make(chan id.UUID, 1)
+	header := make(chan string, 1)
 	consumerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var delivered event.Envelope
 		if err := json.NewDecoder(r.Body).Decode(&delivered); err != nil {
@@ -118,6 +119,7 @@ func TestTheCorrelationIdentifierSurvivesFromRequestToConsumerSpan(t *testing.T)
 		w.WriteHeader(http.StatusOK)
 		select {
 		case applied <- delivered.ID:
+			header <- r.Header.Get(httpapi.CorrelationHeader)
 		default:
 		}
 	}))
@@ -224,6 +226,9 @@ func TestTheCorrelationIdentifierSurvivesFromRequestToConsumerSpan(t *testing.T)
 	case delivered := <-applied:
 		if delivered.String() != eventID {
 			t.Fatalf("the consumer applied %s, want the appended event %s", delivered, eventID)
+		}
+		if got := <-header; got != correlationID.String() {
+			t.Errorf("the delivery carried %s %q, want %s", httpapi.CorrelationHeader, got, correlationID)
 		}
 	case err := <-stopped:
 		t.Fatalf("the dispatcher stopped before delivering: %v", err)
