@@ -24,6 +24,7 @@ Week numbers are relative to the first build week, not calendar dates.
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
 | `verify` | **done** | Local token verification: JWKS caching with rate-limited refetch, `PS256` only, exact issuer, audience, bounded skew, and a mandatory consumer claim rule; 90.2% coverage. STD-IAM-002 §3.5 step 8, the current-state check, is the resource's, after `Verify`: it names `tenant_id` and reads the resource's own records, neither of which this module may do (package doc) |
+| `e2e` | **done** | Tests only. The Week 2 correlation chain, HTTP request to consumer span, against a throwaway database |
 
 `arch.json` already declares the internal edges for every package above, so an
 accidental coupling introduced while writing them fails the build rather than
@@ -205,6 +206,25 @@ together, because the effect itself deliberately does not exist in this reposito
 domain transaction, into an outbox row, across the broker, and into the consumer's
 span.
 
+**Met.** `e2e/correlation_test.go` drives every hop in one process against a throwaway
+PostgreSQL database: a request through `httpapi.Chain`, a domain row and `outbox.Append` in
+one transaction, the dispatcher publishing through `outbox/httpdelivery`, and a consumer
+that restores `observability.Metadata` from the payload, opens its span with
+`StartConsumer`, and applies behind `inbox.Guard`. It asserts the client's value on the
+response, the domain row, the outbox envelope, and the consumer span's `correlation_id`.
+Forcing the middleware to mint a fresh identifier, or dropping the identifier in
+`ContextWithMetadata`, turns it red.
+
+The identifier crosses the broker in the payload, where every consumer reads it. The test also
+asserts the delivery's `X-Correlation-Id` header.
+
+- ✅ **A dispatched delivery carries `X-Correlation-Id`** (TDD-001 2.4.0 §HTTP Delivery). Writing
+  the test showed that it never did. The dispatcher publishes on its own context, which carries no
+  correlation, and `httpdelivery` read the context alone. It now falls back to the envelope's
+  `data.correlation_id`. The context still wins when it carries one, and a malformed value sends
+  no header and does not fail the delivery. The change is additive, with no API change.
+  **Unreleased:** consumers get it with the next patch tag, which needs the owner's approval.
+
 ## Week 3 · Hardening and release
 
 - ✅ Backoff behaviour on empty polls
@@ -215,18 +235,19 @@ span.
 - ✅ A lifecycle backlog of ten thousand rows does not delay a priority event beyond budget
 - ✅ Ordering guarantee across partition boundaries
 - ✅ Tag `v0.1.0`, annotated at `dac9e9d` and pushed
-- ✅ `identity-control` pins `v0.2.1`; `organization-control` holds designs and no Go module yet
+- ✅ `identity-control` and `organization-control` both build against a tag (table below)
 
 **Exit:** both consuming repositories build against a tagged version rather than a
 branch.
 
-**Met.** Every consumer builds against a tag:
+**Met.** Every consumer builds against a tag, with no `replace` directive. Read from each
+`go.mod` on `main` on 2026-10-09:
 
 | Consumer | Pins |
 | :-- | :-- |
-| `organization-control` | `v0.2.7` |
-| `foundation-reference` | `v0.2.6` |
-| `identity-control` | `v0.2.2` |
+| `organization-control` | `v0.4.1` |
+| `foundation-reference` | `v0.3.1` |
+| `identity-control` | `v0.4.0` |
 
 Two tags followed `v0.1.0`. `v0.2.0` added `verify`; `v0.2.1` made the platform migration set
 re-runnable, which is the defect recorded under Environment findings above — the first
@@ -338,15 +359,16 @@ A pull request adding any of these is rejected on principle, not on review prefe
 
 ## Gates
 
-**Design gate.** Both designs at `1.0.0`, with the broker adapter interface fixed.
+✅ **Design gate.** Both designs are approved, `TDD-001` at `2.4.0` and `TDD-002` at
+`1.4.0`, and the broker adapter interface, `outbox.Publisher`, is fixed in TDD-001 §Go
+Surface.
 
-**Release gate.** The design gate, plus: ✅ partition lifecycle exercised end to end,
+✅ **Release gate.** The design gate, plus: ✅ partition lifecycle exercised end to end,
 ✅ dead-letter and substrate runbooks written, ✅ dispatcher contention proven under two
-replicas, ✅ `v0.1.0` tagged and pushed with CI green, and a tagged version consumed by
+replicas, ✅ `v0.1.0` tagged and pushed with CI green, and ✅ a tagged version consumed by
 both control repositories.
 
-Consumer pinning is the one clause still open, and it is held by the consuming
-repositories rather than by this one. Everything this library owes the gate is done.
+Every clause is met. Both control repositories pin a tag; the Week 3 table records which.
 
 ## Departures from the designs, recorded
 

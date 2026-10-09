@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.3.0
+  version: 2.4.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-10-07
+  last_reviewed: 2026-10-09
   parent_sad:
     - SAD-001
     - SAD-004
@@ -790,7 +790,19 @@ func (p *Publisher) Publish(ctx context.Context, e event.Envelope) (outbox.Recei
   dead-lettering the estate's events for it would turn a credential change into lost authority.
 - **A refusal contributes at most 4 KiB** of its body to the dead letter.
 - **The correlation identifier travels** as `X-Correlation-Id`, so the producer's log, the
-  delivery and the consumer's refusal join on one value.
+  delivery and the consumer's refusal join on one value (2.4.0). The value is:
+  - the publishing context's correlation identifier, when the context carries one;
+  - otherwise the envelope's `data.correlation_id`, when it is a valid identifier;
+  - otherwise no header. A missing or malformed value never fails a delivery, because the event is
+    not at fault.
+
+  The dispatcher publishes on its own context, which carries no correlation, so a dispatched
+  delivery takes the envelope's value: the identifier of the request that produced the event
+  (TDD-foundation-platform-002 §Correlation Across the Broker). The context wins when both exist
+  because it is the caller's explicit statement about this publication, such as a replay run
+  under an operator's incident correlation. That was also the only source before 2.4.0, so a
+  caller that already sets one sees no change. The consumer still reads the identifier from the
+  payload, because a broker carries no such header.
 
 A token source is required, and a delivery is never sent unauthenticated. `StaticToken` exists for
 a consumer with no workload identity, such as a local proof. A production producer authenticates

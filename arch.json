@@ -26,7 +26,11 @@
     "redact": [],
     "verify": [],
     "clientauth": [],
-    "outbox/httpdelivery": ["event", "observability", "outbox"]
+    "outbox/httpdelivery": ["event", "observability", "outbox"],
+    "e2e": [
+      "id", "event", "db", "db/dbtest", "migrations", "outbox", "outbox/httpdelivery",
+      "inbox", "httpapi", "observability"
+    ]
   },
 
   "pureSegments": ["domain"],

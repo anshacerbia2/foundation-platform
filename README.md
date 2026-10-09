@@ -38,6 +38,7 @@ it is worth more than the coupling one shared dependency introduces.
 | `verify` | Local bearer-token verification: JWKS caching, `PS256` signature, issuer, audience, expiry |
 | `redact` | Credential redaction for logs, problem documents, and persisted failure detail |
 | `contracts/events` | Versioned event schemas exchanged between the two systems |
+| `e2e` | Tests only, no code: several packages composed the way a consuming system does |
 
 ## The one rule
 

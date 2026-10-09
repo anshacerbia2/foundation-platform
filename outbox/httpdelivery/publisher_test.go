@@ -187,6 +187,94 @@ func TestTheCorrelationIdentifierTravelsWithTheDelivery(t *testing.T) {
 	}
 }
 
+// correlated builds an envelope whose payload carries correlation the way observability.Metadata
+// puts it there.
+func correlated(t *testing.T, correlation any) event.Envelope {
+	t.Helper()
+	built, err := event.New("/systems/organization-control", "com.scnehaux.organization.membership.security.revoked",
+		time.Now().UTC(), map[string]any{"membership_id": "01a05800-0000-7000-8000-000000000001", "correlation_id": correlation})
+	if err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	built.StreamPosition = 3
+	return built
+}
+
+// headerSeen publishes e on ctx and returns the X-Correlation-Id the consumer received.
+func headerSeen(t *testing.T, ctx context.Context, e event.Envelope) (string, bool) {
+	t.Helper()
+	type seenHeader struct {
+		value   string
+		present bool
+	}
+	seen := make(chan seenHeader, 1)
+	publisher := publisherFor(t, func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("X-Correlation-Id")
+		got := seenHeader{present: len(values) > 0}
+		if got.present {
+			got.value = values[0]
+		}
+		seen <- got
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if _, err := publisher.Publish(ctx, e); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	got := <-seen
+	return got.value, got.present
+}
+
+// The dispatcher publishes on its own context, which carries no correlation. Before the envelope
+// was read, every dispatched delivery therefore went out without the header.
+func TestADispatchedDeliveryCarriesTheEnvelopesCorrelation(t *testing.T) {
+	want := mintedID(t)
+	got, present := headerSeen(t, context.Background(), correlated(t, want))
+	if !present || got != want {
+		t.Errorf("X-Correlation-Id = %q (present %v), want the envelope's %s", got, present, want)
+	}
+}
+
+// The context is the caller's statement about this publication, and it was the only source before
+// the envelope's was read, so it still wins.
+func TestTheContextsCorrelationWinsOverTheEnvelopes(t *testing.T) {
+	fromContext, err := event.New("/systems/test", "com.scnehaux.organization.membership.security.revoked", time.Now(), map[string]any{})
+	if err != nil {
+		t.Fatalf("minting an identifier: %v", err)
+	}
+	ctx := observability.WithCorrelationID(context.Background(), fromContext.ID)
+
+	got, _ := headerSeen(t, ctx, correlated(t, mintedID(t)))
+	if got != fromContext.ID.String() {
+		t.Errorf("X-Correlation-Id = %q, want the context's %s", got, fromContext.ID)
+	}
+}
+
+// A value that is not an identifier is not reflected into a header, and it does not fail the
+// delivery: the event is not at fault.
+func TestAMalformedEnvelopeCorrelationSendsNoHeaderAndStillDelivers(t *testing.T) {
+	for name, value := range map[string]any{
+		"not an identifier": "not-a-uuid\r\nX-Injected: yes",
+		"a number":          42,
+		"null":              nil,
+	} {
+		if got, present := headerSeen(t, context.Background(), correlated(t, value)); present {
+			t.Errorf("%s: X-Correlation-Id = %q, want no header", name, got)
+		}
+	}
+	if got, present := headerSeen(t, context.Background(), envelope(t)); present {
+		t.Errorf("a payload without correlation_id: X-Correlation-Id = %q, want no header", got)
+	}
+}
+
+func mintedID(t *testing.T) string {
+	t.Helper()
+	minted, err := event.New("/systems/test", "com.scnehaux.organization.membership.security.revoked", time.Now(), map[string]any{})
+	if err != nil {
+		t.Fatalf("minting an identifier: %v", err)
+	}
+	return minted.ID.String()
+}
+
 func TestConstructionRefusesAnUnauthenticatedPublisher(t *testing.T) {
 	for name, cfg := range map[string]httpdelivery.Config{
 		"an empty credential": {Endpoint: "http://127.0.0.1:8096/v1/deliveries", Tokens: httpdelivery.StaticToken(""),
