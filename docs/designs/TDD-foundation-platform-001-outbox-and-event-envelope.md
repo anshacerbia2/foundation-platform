@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.4.0
+  version: 2.4.1
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-10-09
+  last_reviewed: 2026-10-15
   parent_sad:
     - SAD-001
     - SAD-004
@@ -138,8 +138,8 @@ sequenceDiagram
     P->>O: Mark published and write the delivery receipt, in the outcome's own transaction, fenced on the lease
 ```
 
-The adapter is the host's. Today the only one is `foundation-reference`'s
-`dispatch.HTTPPublisher`, which is ADR-GLB-016's Direct Durable Delivery profile. A broker
+The host chooses the adapter. Today the only one is this module's `outbox/httpdelivery` (§HTTP
+Delivery), ADR-GLB-016's Direct Durable Delivery profile, which the producer runs. A broker
 adapter would sit in the same place and change nothing here, except that a broker cannot carry
 the consumer's application marker, so every receipt it produced would be `transport_accepted`.
 
@@ -764,8 +764,9 @@ No secret, token, credential, or unrestricted personal data appears in any field
 `outbox/httpdelivery` is the Direct Durable Delivery adapter (`ADR-GLB-016 §5.4`): an
 `outbox.Publisher` that posts each envelope to one consumer's acceptance API. It was
 `foundation-reference`'s `internal/dispatch` and moved here when the producer took over its
-consumers' dispatchers (`ADR-GLB-018 §5.4`). The producer and the reference consumer now run one
-implementation of the contract below.
+consumers' dispatchers (`ADR-GLB-018 §5.4`). The producer runs the one implementation of the
+contract below, for every consumer it delivers to. `foundation-reference` no longer ships a copy
+(2.4.1, `ADR-GLB-018` Alternative G, amended 2026-10-15): Organization Control delivers to it.
 
 ```go
 package httpdelivery
@@ -1198,9 +1199,9 @@ investigation.
 ADR-GLB-016 selects a delivery profile per contract rather than one broker for the enterprise.
 What that means for this module:
 
-- **The `Publisher` interface is the seam.** The adapter satisfying it lives in each host, and
+- **The `Publisher` interface is the seam.** Each host chooses the adapter satisfying it, and
   this module holds no broker client. Membership security events currently use Direct Durable
-  Delivery over HTTP (`foundation-reference`'s `dispatch.HTTPPublisher`).
+  Delivery over HTTP (`outbox/httpdelivery`, run by the producer).
 - **The dead letter stays local.** `platform.dead_letter` covers outbox-to-consumer publication.
   It survives a broker outage, and it is the incident record dead-letter resolution is built on,
   so it stays whichever profile a contract uses.

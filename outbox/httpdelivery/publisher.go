@@ -3,8 +3,8 @@
 // TDD-foundation-platform-001 §HTTP Delivery.
 //
 // It was foundation-reference's internal/dispatch and moved here when the producer took over its
-// consumers' dispatchers (ADR-GLB-018 §5.4), so the producer and the reference consumer run one
-// implementation of the contract below.
+// consumers' dispatchers (ADR-GLB-018 §5.4). The producer runs the one implementation of the
+// contract below; foundation-reference no longer ships a copy.
 package httpdelivery
 
 import (
