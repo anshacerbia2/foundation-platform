@@ -8,7 +8,10 @@ import (
 	"github.com/anshacerbia2/foundation-platform/redact"
 )
 
-// ProblemType is a closed registry key for the RFC 7807 types exposed by control APIs.
+// ProblemType is a closed registry key for the RFC 9457 types exposed by control APIs.
+//
+// The numeric values are not identifiers. A document carries the type URI, and consumers name the
+// constants. Types are declared in status order, so a new type moves the values after it.
 type ProblemType uint8
 
 const (
@@ -16,6 +19,17 @@ const (
 	AuthenticationRequired
 	Forbidden
 	NotFound
+
+	// InvitationNotAcceptable is the one refusal an invitation lookup answers when it fails: an
+	// unknown, expired, revoked, already accepted or mismatched token (ADR-ORG-007 §5.4).
+	//
+	// Distinct from NotFound, which says nothing about why, and constant for every failure it
+	// covers, so an attacker holding a guessed token cannot tell which check failed. RFC 9457 §5
+	// warns of "leaking information that can be exploited to compromise the system". A client
+	// branches on the type and never on the detail: "Consumers MUST use the "type" URI (after
+	// resolution, if necessary) as the problem type's primary identifier" (RFC 9457 §3.1.1). The
+	// first resource-specific type, which STD-GLB-001 1.7.0 requires to be defined here, once.
+	InvitationNotAcceptable
 	VersionConflict
 	IdempotencyKeyConflict
 	StateTransitionRefused
@@ -55,20 +69,21 @@ type problemDefinition struct {
 }
 
 var problemRegistry = map[ProblemType]problemDefinition{
-	ValidationFailed:       {"https://problems.scnehaux.com/validation-failed", "The request is invalid", http.StatusBadRequest},
-	AuthenticationRequired: {"https://problems.scnehaux.com/authentication-required", "Authentication is required", http.StatusUnauthorized},
-	Forbidden:              {"https://problems.scnehaux.com/forbidden", "The operation is forbidden", http.StatusForbidden},
-	NotFound:               {"https://problems.scnehaux.com/not-found", "The requested resource was not found", http.StatusNotFound},
-	VersionConflict:        {"https://problems.scnehaux.com/version-conflict", "The record changed since it was read", http.StatusConflict},
-	IdempotencyKeyConflict: {"https://problems.scnehaux.com/idempotency-key-conflict", "The idempotency key was reused with a different request", http.StatusConflict},
-	StateTransitionRefused: {"https://problems.scnehaux.com/state-transition-refused", "The requested state transition was refused", http.StatusConflict},
-	RequestInProgress:      {"https://problems.scnehaux.com/request-in-progress", "An identical request is still in progress", http.StatusConflict},
-	PreconditionUnmet:      {"https://problems.scnehaux.com/precondition-unmet", "A request precondition was not met", http.StatusPreconditionFailed},
-	PayloadTooLarge:        {"https://problems.scnehaux.com/payload-too-large", "The request content is too large", http.StatusRequestEntityTooLarge},
-	RateLimited:            {"https://problems.scnehaux.com/rate-limited", "The request rate is too high", http.StatusTooManyRequests},
-	Overloaded:             {"https://problems.scnehaux.com/overloaded", "The service is overloaded", http.StatusServiceUnavailable},
-	DependencyUnavailable:  {"https://problems.scnehaux.com/dependency-unavailable", "A required dependency is unavailable", http.StatusServiceUnavailable},
-	Internal:               {"https://problems.scnehaux.com/internal", "An internal error occurred", http.StatusInternalServerError},
+	ValidationFailed:        {"https://problems.scnehaux.com/validation-failed", "The request is invalid", http.StatusBadRequest},
+	AuthenticationRequired:  {"https://problems.scnehaux.com/authentication-required", "Authentication is required", http.StatusUnauthorized},
+	Forbidden:               {"https://problems.scnehaux.com/forbidden", "The operation is forbidden", http.StatusForbidden},
+	NotFound:                {"https://problems.scnehaux.com/not-found", "The requested resource was not found", http.StatusNotFound},
+	InvitationNotAcceptable: {"https://problems.scnehaux.com/invitation-not-acceptable", "The invitation cannot be accepted", http.StatusNotFound},
+	VersionConflict:         {"https://problems.scnehaux.com/version-conflict", "The record changed since it was read", http.StatusConflict},
+	IdempotencyKeyConflict:  {"https://problems.scnehaux.com/idempotency-key-conflict", "The idempotency key was reused with a different request", http.StatusConflict},
+	StateTransitionRefused:  {"https://problems.scnehaux.com/state-transition-refused", "The requested state transition was refused", http.StatusConflict},
+	RequestInProgress:       {"https://problems.scnehaux.com/request-in-progress", "An identical request is still in progress", http.StatusConflict},
+	PreconditionUnmet:       {"https://problems.scnehaux.com/precondition-unmet", "A request precondition was not met", http.StatusPreconditionFailed},
+	PayloadTooLarge:         {"https://problems.scnehaux.com/payload-too-large", "The request content is too large", http.StatusRequestEntityTooLarge},
+	RateLimited:             {"https://problems.scnehaux.com/rate-limited", "The request rate is too high", http.StatusTooManyRequests},
+	Overloaded:              {"https://problems.scnehaux.com/overloaded", "The service is overloaded", http.StatusServiceUnavailable},
+	DependencyUnavailable:   {"https://problems.scnehaux.com/dependency-unavailable", "A required dependency is unavailable", http.StatusServiceUnavailable},
+	Internal:                {"https://problems.scnehaux.com/internal", "An internal error occurred", http.StatusInternalServerError},
 }
 
 // ProblemDocument is the sole error representation written by this package.

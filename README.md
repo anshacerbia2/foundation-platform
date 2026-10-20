@@ -30,8 +30,8 @@ it is worth more than the coupling one shared dependency introduces.
 | `migrations` | The `platform` schema, embedded so consumers receive it through `go.mod` |
 | `event` | CloudEvents 1.0 envelope construction, type naming, schema version binding |
 | `inbox` | Deduplication guard over `platform.processed_event` |
-| `idempotency` | Idempotency key claim, conflict detection, stored-response replay |
-| `httpapi` | Routing, middleware, RFC 7807 problem serialization |
+| `idempotency` | Idempotency key claim, conflict detection, stored-response replay, a stored response without the secrets answered once, and expiry of completed keys |
+| `httpapi` | Routing, middleware, RFC 9457 problem serialization from a closed registry |
 | `db` | Pool construction and the transaction manager that binds outbox writes to domain writes |
 | `db/dbtest` | A `db.Tx` that records statements, so packages forbidden from naming the driver can still be tested |
 | `observability` | Tracing, metrics, structured logging, correlation propagation |
@@ -51,6 +51,12 @@ shared library is a back channel between two authorities that are supposed to ha
 none, and it would erode exactly the boundary the architecture is built on.
 
 A type that names a business concept belongs in the system that owns it.
+
+**One narrow exception: the problem-type registry.** `STD-GLB-001` 1.7.0 requires every problem
+type to be defined once, in this module's closed registry, including a type specific to one
+resource. `httpapi.InvitationNotAcceptable` is the first. It is a URI, a title and a status. No
+code here knows what an invitation is, and no behaviour hangs on it (TDD-002 §Problem Type
+Registry).
 
 ## Governance lineage
 
@@ -235,6 +241,42 @@ The claim, mutation, outbox append, and `idempotency.Complete` belong in one tra
 A matching completed claim returns a stored response; a different digest returns
 `idempotency.ErrConflict`; an unfinished matching claim returns
 `idempotency.ErrInProgress`.
+
+**A secret answered once is never recorded** (`STD-GLB-001` 1.7.0). A command whose answer
+carries a secret, such as an invitation token or a first credential, sends the live body and
+records it without the secret. A replay then answers the result without it, and a lost secret
+is revoked and issued again:
+
+```go
+// live is {"invitation": {...}, "token": "..."}; the record is {"invitation": {...}}.
+if err := idempotency.CompleteWithheld(ctx, tx, scope, key, digest, http.StatusCreated, live, "/token"); err != nil {
+    return err
+}
+```
+
+The members are RFC 6901 JSON Pointers. A pointer that names nothing fails with
+`idempotency.ErrNotWithheld` rather than recording the body unchanged. `idempotency.Withhold`
+returns the stored body alone, for a consumer that completes the claim elsewhere, as
+organization-control's `db.Respond` does.
+
+**Completed keys expire.** Each service publishes how long it keeps a key, at least 24 hours
+and at least as long as any client retries, and its maintenance stage purges past it:
+
+```go
+err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+    purged, err := idempotency.PurgeCompleted(ctx, tx, 72*time.Hour) // the published window
+    if err != nil {
+        return err
+    }
+    logger.Info("purged completed idempotency keys", "count", purged)
+    return nil
+})
+```
+
+The window is computed by the database clock. A window under `idempotency.MinimumRetention`
+(24 hours) is refused, by the Go call and by `platform.purge_idempotency_keys` itself. An
+uncompleted key is never purged, because a retry finding no key would execute the command
+again. The maintenance role needs `SELECT` and `DELETE` on `platform.idempotency_key`.
 
 ## Verifying a token
 

@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-002
   title: HTTP Substrate, Persistence, and Telemetry
   owner: Core Platform Team
-  version: 1.4.0
+  version: 1.5.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-11
-  last_reviewed: 2026-10-07
+  last_reviewed: 2026-10-20
   parent_sad:
     - SAD-001
     - SAD-004
@@ -212,6 +212,7 @@ https://problems.scnehaux.com/validation-failed             400
 https://problems.scnehaux.com/authentication-required       401
 https://problems.scnehaux.com/forbidden                     403
 https://problems.scnehaux.com/not-found                     404
+https://problems.scnehaux.com/invitation-not-acceptable     404
 https://problems.scnehaux.com/version-conflict              409
 https://problems.scnehaux.com/idempotency-key-conflict      409
 https://problems.scnehaux.com/state-transition-refused      409
@@ -239,10 +240,35 @@ MUST specify the limit exceeded in the body of the error response" (RFC 7644 §3
 RFC 7644's name for the status; RFC 9110 later renamed it Content Too Large, and the code is the
 same.
 
+**`invitation-not-acceptable` is not `not-found` (1.5.0).** Organization Control answers it,
+404, for every failed invitation lookup: an unknown, expired, revoked, already accepted or
+mismatched token (`ADR-ORG-007` §5.4). The title is "The invitation cannot be accepted".
+
+- **One status and one constant detail for every failure it covers.** An attacker holding a
+  guessed token must not learn which check failed. RFC 9457 §5 warns of "leaking information that
+  can be exploited to compromise the system" [R5]. The answering service keeps the detail constant;
+  this registry fixes the URI, title and status.
+- **A client branches on the type.** "Consumers MUST use the "type" URI (after resolution, if
+  necessary) as the problem type's primary identifier" [R5]. Organization Experience tells the
+  person to ask whoever invited them on this type, not on a `404`.
+- **It is a resource-specific type, defined here once.** `STD-GLB-001` 1.7.0: "A problem type is
+  defined once, in foundation-platform's closed registry", and a new type documents what RFC 9457
+  §4 requires: "1. a type URI ... 2. a title that appropriately describes it (think short) 3. the
+  HTTP status code for it to be used with" [R5]. RFC 9457 reserves new types for such conditions:
+  "truly generic problems -- i.e., conditions that might apply to any resource on the Web -- are
+  usually better expressed as plain status codes" [R5].
+- **It is a wire identifier, not a domain concept.** The README's rule keeps domain types and
+  behaviour out of this module. The registry holds a URI, a title and a status, and no code here
+  knows what an invitation is. The rule's purpose, no back channel between two authorities, is
+  kept: the type is answered by one system and read by its clients.
+- **Declared in status order**, after `NotFound`, so the numeric values of the constants after it
+  moved. Nothing serializes those values.
+
 | Ref | Source |
 | :-- | :-- |
 | R3 | IETF, *RFC 9110 HTTP Semantics*, §15.5.14 413 Content Too Large, <https://www.rfc-editor.org/rfc/rfc9110#section-15.5.14>, accessed 2026-10-07 |
 | R4 | IETF, *RFC 7644 System for Cross-domain Identity Management: Protocol*, §3.7.4 Maximum Operations, <https://www.rfc-editor.org/rfc/rfc7644#section-3.7.4>, accessed 2026-10-07 |
+| R5 | IETF, *RFC 9457 Problem Details for HTTP APIs*, §3.1.1, §4, §5, <https://www.rfc-editor.org/rfc/rfc9457>, accessed 2026-10-20 |
 
 ```json
 {
@@ -392,6 +418,8 @@ directly; the composition root constructs and injects it.
 - Every declared constant has a complete registry entry (`TestEveryProblemTypeIsRegistered`).
 - `payload-too-large` answers 413 with a `detail` naming the limit, and is distinguishable from
   `validation-failed` (`TestPayloadTooLargeAnswers413`).
+- `invitation-not-acceptable` answers 404 under its own URI and title, and is distinguishable
+  from `not-found` (`TestInvitationNotAcceptableIsItsOwnType`).
 - No response body, at any status, contains a token, credential, key, or cookie value,
   asserted by fuzzing handler errors with credential-shaped input.
 - A `detail` string never echoes a request body value.
@@ -466,7 +494,7 @@ export failure.
 | Parent system | SAD-001 — Scnehaux Identity Runtime |
 | Parent system | SAD-004 — Scnehaux Organization Control |
 | Governed by | ADR-GLB-005 — load shedding and resilience invariants |
-| Conforms to | STD-GLB-001 — RFC 7807 problem details; JSON over HTTP; path-level versioning |
+| Conforms to | STD-GLB-001 1.7.0 — RFC 9457 problem details and the closed registry; JSON over HTTP; path-level versioning |
 | Conforms to | STD-GLB-003 — observability |
 | Enterprise constraint | EAD-005 §5.3 — OpenTelemetry-compatible instrumentation and vendor-neutral export |
 | Related design | `TDD-foundation-platform-001` — outbox, dispatcher, envelope |

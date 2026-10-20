@@ -16,7 +16,7 @@
     "id": [],
     "event": ["id"],
     "inbox": ["id", "event", "db", "db/dbtest"],
-    "idempotency": ["db", "db/dbtest"],
+    "idempotency": ["db", "db/dbtest", "migrations"],
     "outbox": ["id", "event", "db", "db/dbtest", "migrations", "redact"],
     "db": [],
     "db/dbtest": ["db"],
