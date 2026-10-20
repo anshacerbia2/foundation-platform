@@ -223,7 +223,7 @@ asserts the delivery's `X-Correlation-Id` header.
   correlation, and `httpdelivery` read the context alone. It now falls back to the envelope's
   `data.correlation_id`. The context still wins when it carries one, and a malformed value sends
   no header and does not fail the delivery. The change is additive, with no API change.
-  **Unreleased:** consumers get it with the next patch tag, which needs the owner's approval.
+  **Released in `v0.5.0`** (#22; the tag is annotated at `40d348e` and pushed, Week 6).
 
 ## Week 3 · Hardening and release
 
@@ -315,12 +315,15 @@ Consequences for consumers, owned by them:
 ## Week 6 · Owner decisions of 2026-10-20
 
 Built for the decisions `scnehaux-architecture` #102 recorded, O6 and O7 there:
-`STD-GLB-001` 1.7.0 and `ADR-ORG-007` §5.4 and §5.5. `TDD-001` 2.5.0 §Idempotency and
-`TDD-002` 1.5.0 §Problem Type Registry are the current statements.
+`STD-GLB-001` 1.7.0 and `ADR-ORG-007` §5.4 and §5.5. `TDD-001` 2.5.1 §Idempotency and
+`TDD-002` 1.5.0 §Problem Type Registry are the current statements. `STD-GLB-001` 1.8.0, merged
+with scnehaux-architecture #108, sets the window at 7 days from completion and records the
+problem-type registry as a narrow exception to this repository's one rule. Neither needs code
+here: each consumer passes 7 days to `PurgeCompleted`.
 
 | Tag | Adds |
 | :-- | :-- |
-| `v0.5.0` | `httpapi.InvitationNotAcceptable`, `https://problems.scnehaux.com/invitation-not-acceptable`, "The invitation cannot be accepted", 404: the one refusal for every failed invitation lookup (`ADR-ORG-007` §5.4). `idempotency.Withhold` and `idempotency.CompleteWithheld`: a command records its answer without the secret it answered once, named by RFC 6901 pointers, so a replay answers the result without the secret. `idempotency.PurgeCompleted` and `idempotency.MinimumRetention` over `platform.purge_idempotency_keys(retain_for interval)` (`0011`): completed keys older than the service's published window are deleted, never under 24 hours, never an uncompleted key. `0011` also creates the partial index `idempotency_key_completed`. Additive: no signature changes. The numeric values of the problem-type constants after `NotFound` moved, and nothing serializes them. The maintenance role needs `SELECT` and `DELETE` on `platform.idempotency_key`. The index build blocks writes to `platform.idempotency_key` while it runs |
+| `v0.5.0` | `httpapi.InvitationNotAcceptable`, `https://problems.scnehaux.com/invitation-not-acceptable`, "The invitation cannot be accepted", 404: the one refusal for every failed invitation lookup (`ADR-ORG-007` §5.4). `idempotency.Withhold` and `idempotency.CompleteWithheld`: a command records its answer without the secret it answered once, named by RFC 6901 pointers, so a replay answers the result without the secret. `idempotency.PurgeCompleted` and `idempotency.MinimumRetention` over `platform.purge_idempotency_keys(retain_for interval)` (`0011`): completed keys older than the service's published window are deleted, never under 24 hours, never an uncompleted key. `0011` also creates the partial index `idempotency_key_completed`. It also carries `golang.org/x/net` v0.60.0 (#21, GO-2026-6603, -6611, -6612 and -6617) and a dispatched delivery's `X-Correlation-Id` from the envelope (#22, Week 2). Annotated tag at `40d348e`, pushed. Additive: no signature changes. The numeric values of the problem-type constants after `NotFound` moved, and nothing serializes them. The maintenance role needs `SELECT` and `DELETE` on `platform.idempotency_key`. The index build blocks writes to `platform.idempotency_key` while it runs |
 
 Consequences for consumers, owned by them:
 
@@ -334,6 +337,11 @@ Consequences for consumers, owned by them:
 - `identity-control`: pin `v0.5.0`. Its first credential already records no value; it may move
   to `CompleteWithheld`. Its maintenance job calls `PurgeCompleted` with a published window.
 - `foundation-reference`: pin `v0.5.0`; nothing else is required.
+
+- ✅ **`TDD-001` 2.5.1 §Idempotency states what `Withhold` changes** (2026-10-20; `STD-GLB-001`
+  1.7.0). It said `Withhold` "changes nothing else". It re-serializes the body: members sorted by
+  name, whitespace removed, `<`, `>` and `&` escaped, numbers kept exactly. The values are the same.
+  Wording only; the code and its tests already did this.
 
 ## Decisions this repository does not make
 

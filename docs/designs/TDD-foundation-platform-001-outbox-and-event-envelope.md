@@ -3,7 +3,7 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.5.0
+  version: 2.5.1
   status: approved
   classification: restricted
   review_cycle_days: 90
@@ -600,9 +600,23 @@ of the previously completed operation, success or an error" (§2.6 [R11]); the r
 returned, and the secret is withheld.
 
 - **The stored body is derived from the live one.** `Withhold(body, pointers...)` removes the
-  members the pointers name and changes nothing else. A consumer that rendered the stored body
+  members the pointers name and keeps every other value. A consumer that rendered the stored body
   with a second renderer would let the two drift: a field added to one and not the other would
   make a replay answer something the first response did not.
+- **The stored body is re-serialized, so its bytes differ from the live body's (2.5.1).**
+  `Withhold` decodes the body, removes the members, and encodes it again with Go's
+  `encoding/json`. Three things change in the text and none in the value:
+  - object members come out sorted by name: "The map keys are sorted" [R16];
+  - insignificant whitespace is gone;
+  - `<`, `>`, `&`, U+2028 and U+2029 in strings are escaped as `\u003c` and the like: "the string
+    is encoded using HTMLEscape" [R16].
+
+  Numbers keep their exact text, because the decoder uses `UseNumber`
+  (`TestWithholdRemovesTheSecretAndKeepsTheResult` asserts both the order and the number). The
+  order carries no meaning: "An object is an unordered collection of zero or more name/value
+  pairs", and parsers "differ as to whether or not they make the ordering of object members
+  visible" (RFC 8259 §1, §4 [R17]). A replay's bytes can therefore differ from the first
+  response's while its values, the secret aside, are the same.
 - **The members are named by RFC 6901 JSON Pointers**, such as `/token` or
   `/credential/value`. JSON Pointer "defines a string syntax for identifying a specific value
   within a JavaScript Object Notation (JSON) document" [R12]. A pointer must name an object
@@ -617,7 +631,9 @@ returned, and the secret is withheld.
 **Completed keys expire (2.5.0).** The draft: "The resource MAY require time based idempotency
 keys to be able to purge or delete a key upon its expiry. The resource SHOULD define such
 expiration policy and publish it in the documentation" (§2.3 [R11]). Each consuming service
-publishes its window and calls the purge from its maintenance stage.
+publishes its window and calls the purge from its maintenance stage. `STD-GLB-001` 1.8.0 sets
+that window for the estate: "The window is 7 days from completion" (2.5.1). A consumer passes 7
+days as `retain_for`; this module keeps no window of its own beyond the 24-hour floor below.
 
 ```sql
 CREATE INDEX idempotency_key_completed
@@ -658,6 +674,8 @@ platform.purge_idempotency_keys(retain_for INTERVAL) RETURNS BIGINT
 | R13 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, §9.9 Date/Time Functions and Operators, <https://www.postgresql.org/docs/17/functions-datetime.html>, accessed 2026-10-20 |
 | R14 | Stripe, *Idempotent requests*, <https://docs.stripe.com/api/idempotent_requests>, accessed 2026-10-20 |
 | R15 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, §11.8 Partial Indexes, <https://www.postgresql.org/docs/17/indexes-partial.html>, accessed 2026-10-20 |
+| R16 | The Go Authors, *encoding/json*, `Marshal`, <https://pkg.go.dev/encoding/json>, accessed 2026-10-20: "The map keys are sorted"; "the string is encoded using HTMLEscape, which replaces "<", ">", "&", U+2028, and U+2029" |
+| R17 | IETF, *RFC 8259 The JavaScript Object Notation (JSON) Data Interchange Format*, §1 and §4, <https://www.rfc-editor.org/rfc/rfc8259>, accessed 2026-10-20: "An object is an unordered collection of zero or more name/value pairs"; "JSON parsing libraries have been observed to differ as to whether or not they make the ordering of object members visible to calling software" |
 
 ### Isolation Posture of the `platform` Schema
 
@@ -1301,6 +1319,7 @@ investigation.
 | Governed by | ADR-GLB-006 — Event Versioning and Schema Evolution |
 | Conforms to | STD-GLB-004 — CloudEvents envelope, deduplication, retry and dead-letter |
 | Conforms to | STD-GLB-001 1.7.0 — RFC 9457 problem details; a secret answered once is never in the idempotency record; completed keys expire |
+| Conforms to | STD-GLB-001 1.8.0 — the window is 7 days from completion, passed by each consumer; the module's purge is proven against PostgreSQL (`TestPurgeDeletesOnlyCompletedKeysPastTheWindow`), and each service tests its own (2.5.1) |
 | Conforms to | STD-GLB-002 — sequence is a stream position, not an entity identifier |
 | Enterprise constraint | EAD-004 — commands, facts, and outcomes are distinct; mutations are duplicate-safe |
 | Enterprise constraint | EAD-003 — private domain persistence; no cross-domain database access |
