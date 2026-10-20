@@ -52,7 +52,7 @@ none, and it would erode exactly the boundary the architecture is built on.
 
 A type that names a business concept belongs in the system that owns it.
 
-**One narrow exception: the problem-type registry.** `STD-GLB-001` 1.7.0 requires every problem
+**One narrow exception: the problem-type registry.** `STD-GLB-001` 1.8.0 requires every problem
 type to be defined once, in this module's closed registry, including a type specific to one
 resource. `httpapi.InvitationNotAcceptable` is the first. It is a URI, a title and a status. No
 code here knows what an invitation is, and no behaviour hangs on it (TDD-002 §Problem Type
