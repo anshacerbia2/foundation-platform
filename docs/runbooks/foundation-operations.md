@@ -47,6 +47,17 @@ system's `platform` schema from the other.
 5. Investigate every retained old partition; an unpublished row is intentionally a hard
    stop on dropping it
 
+## Idempotency key retention
+
+1. The maintenance stage runs `idempotency.PurgeCompleted` with the window the service publishes,
+   at least 24 hours and at least as long as any client retries (STD-GLB-001 1.7.0)
+2. A refusal of the window (`ErrRetentionTooShort`, or `shorter than 24 hours` from
+   `platform.purge_idempotency_keys`) is a configuration error; fix the window, never the floor
+3. Uncompleted keys are never purged. An old one is a claim whose response was never recorded;
+   investigate it as a duplicate-effect risk, and do not delete it by hand
+4. A secret found in `platform.idempotency_key.response_body` is an incident: revoke the secret,
+   delete that row, and change the command to complete with `idempotency.CompleteWithheld`
+
 ## Duplicate-effect investigation
 
 1. Confirm the handler called `inbox.Guard` in the same transaction as its effect

@@ -268,3 +268,37 @@ func TestPayloadTooLargeAnswers413(t *testing.T) {
 		t.Errorf("payload-too-large is indistinguishable from validation-failed: %+v and %+v", tooLarge, invalid)
 	}
 }
+
+// TestInvitationNotAcceptableIsItsOwnType states why the type was added (ADR-ORG-007 §5.4).
+//
+// An invitation lookup answers one refusal for every failure: an unknown, expired, revoked, already
+// accepted or mismatched token. It answers 404, like not-found, and a client must still tell the two
+// apart, because RFC 9457 §3.1.1 makes the type the identifier: "Consumers MUST use the "type" URI
+// (after resolution, if necessary) as the problem type's primary identifier". RFC 9457 §4 requires a
+// type URI, a short title, and the status a new type is used with.
+func TestInvitationNotAcceptableIsItsOwnType(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/invitations:accept", nil)
+	response := httptest.NewRecorder()
+
+	Problem(response, request, InvitationNotAcceptable, "Ask whoever invited you for a new invitation.")
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", response.Code)
+	}
+	var document ProblemDocument
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatalf("problem JSON: %v", err)
+	}
+	if document.Type != "https://problems.scnehaux.com/invitation-not-acceptable" ||
+		document.Title != "The invitation cannot be accepted" || document.Status != http.StatusNotFound {
+		t.Errorf("problem = %+v", document)
+	}
+
+	notAcceptable := problemRegistry[InvitationNotAcceptable]
+	notFound := problemRegistry[NotFound]
+	if notAcceptable.URI == notFound.URI {
+		t.Error("invitation-not-acceptable shares not-found's URI, so a client cannot branch on it")
+	}
+	if notAcceptable.Status != notFound.Status {
+		t.Errorf("status = %d, want not-found's %d", notAcceptable.Status, notFound.Status)
+	}
+}

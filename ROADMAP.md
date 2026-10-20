@@ -18,8 +18,8 @@ Week numbers are relative to the first build week, not calendar dates.
 | `migrations` | **done** | Embedded schema plus UTC daily partition creation, default-row relocation, and published-only retention drop |
 | `outbox` | **done** | Append, two-lane dispatcher, retry/dead letter, persisted-error redaction, retention helpers, and 10,000-row priority proof |
 | `inbox` | **done** | Transactional composite-key guard over `(event_id, consumer)`; 100% unit coverage |
-| `idempotency` | **done** | Caller-scoped claim, digest conflict, in-progress state, completion, and stored-response replay |
-| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and a closed RFC 9457 registry of fourteen types |
+| `idempotency` | **done** | Caller-scoped claim, digest conflict, in-progress state, completion, stored-response replay, a stored response without the secret answered once (`CompleteWithheld`), and expiry of completed keys (`PurgeCompleted`), proven against PostgreSQL |
+| `httpapi` | **done** | Fixed middleware order, correlation, shedding, timeout propagation, recovery, server defaults, and a closed RFC 9457 registry of fifteen types |
 | `observability` | **done** | OpenTelemetry spans/metrics, redacted structured logging, broker propagation, and explicit producer-consumer links |
 | `redact` | **done** | Shared credential redaction for text and structured `slog` attributes |
 | `contracts/events` | **done** | Temporary registry and compatibility gate; event definitions remain owned by publishing systems |
@@ -302,11 +302,8 @@ activations (`ADR-ORG-002 §5.3`). `TDD-001 §Per-Consumer Delivery` is the curr
 | Tag | Adds |
 | :-- | :-- |
 | `v0.3.0` | `platform.subscription` and `platform.outbox_delivery` (`0009`). `Append` writes one delivery per subscriber in the event's own transaction, under a shared advisory lock that `Subscribe` takes exclusive. The dispatcher claims `Config.Consumer`'s deliveries alone. A dead letter is keyed `(event_id, consumer)`. `To(consumer)` owes a replay to one consumer and returns `ErrNotSubscribed` when it would owe nobody. **Breaking**: the outbox loses its publication columns, `0001` and `0008` are guarded so the set stays re-runnable, and the dispatch role needs `SELECT, UPDATE` on `platform.outbox_delivery` and only `SELECT` on `platform.outbox`. Drain the outbox before applying `0009`: an unpublished event has no delivery afterwards |
-
 | `v0.3.1` | `Abandon(tx, consumer, reason)` closes a retired consumer's owed deliveries as `abandoned`, so they stop holding retention (`ADR-GLB-018 §5.5`). `Append` reads nothing back from the outbox, so a publishing role needs no `SELECT` on it: `INSERT` on `platform.outbox` and `platform.outbox_delivery`, and `SELECT (consumer, event_types, retired_at)` on `platform.subscription` (§5.6) |
-
 | `v0.4.0` | `clientauth`: the client credentials grant with a `private_key_jwt` assertion (RFC 6749 §4.4, RFC 7523), a cached token, and `Invalidate` for a 401. `outbox/httpdelivery`: the Direct Durable Delivery publisher, moved from foundation-reference, now taking a `TokenSource`, so a producer's dispatcher authenticates as its workload (ADR-GLB-018 §5.4, STD-IAM-001 §3). A 401 drops the cached token and retries. `StaticToken` is kept for a local proof |
-
 | `v0.4.1` | `httpapi.PayloadTooLarge`, `https://problems.scnehaux.com/payload-too-large`, 413: a well-formed request over a declared limit, which RFC 7644 §3.7.4 requires for a bulk request and which `organization-control`'s Membership batch was answering as `validation-failed` (TDD-002 §Problem Type Registry). `0010` indexes `platform.outbox_delivery (event_id)`, so one event's deliveries are read without scanning every partition (TDD-001 §Per-Consumer Delivery). No grant changes. The index build blocks writes to `platform.outbox_delivery` while it runs |
 
 Consequences for consumers, owned by them:
@@ -314,6 +311,29 @@ Consequences for consumers, owned by them:
 - `organization-control` subscribes each named consumer, drops `consumer_single_active`, and reads
   frontier, debt, replay and closure per consumer from `platform.outbox_delivery`.
 - A host that owns a dispatcher runs one per consumer, each with its own endpoint and credential.
+
+## Week 6 · Owner decisions of 2026-10-20
+
+Built for the decisions `scnehaux-architecture` #102 recorded, O6 and O7 there:
+`STD-GLB-001` 1.7.0 and `ADR-ORG-007` §5.4 and §5.5. `TDD-001` 2.5.0 §Idempotency and
+`TDD-002` 1.5.0 §Problem Type Registry are the current statements.
+
+| Tag | Adds |
+| :-- | :-- |
+| `v0.5.0` | `httpapi.InvitationNotAcceptable`, `https://problems.scnehaux.com/invitation-not-acceptable`, "The invitation cannot be accepted", 404: the one refusal for every failed invitation lookup (`ADR-ORG-007` §5.4). `idempotency.Withhold` and `idempotency.CompleteWithheld`: a command records its answer without the secret it answered once, named by RFC 6901 pointers, so a replay answers the result without the secret. `idempotency.PurgeCompleted` and `idempotency.MinimumRetention` over `platform.purge_idempotency_keys(retain_for interval)` (`0011`): completed keys older than the service's published window are deleted, never under 24 hours, never an uncompleted key. `0011` also creates the partial index `idempotency_key_completed`. Additive: no signature changes. The numeric values of the problem-type constants after `NotFound` moved, and nothing serializes them. The maintenance role needs `SELECT` and `DELETE` on `platform.idempotency_key`. The index build blocks writes to `platform.idempotency_key` while it runs |
+
+Consequences for consumers, owned by them:
+
+- `organization-control`: pin `v0.5.0`. The issue command records `{"invitation"}` only, through
+  `idempotency.Withhold(live, "/token")` in its `db.Respond` responder, and answers the token
+  live; a test that the record holds no token and a replay answers none. The acceptance lookup
+  answers `httpapi.InvitationNotAcceptable`. The maintenance stage calls
+  `idempotency.PurgeCompleted` with a published window, and its maintenance role is granted
+  `SELECT, DELETE` on `platform.idempotency_key`. `TDD-organization-control-004` corrects the
+  claim that the token is never stored.
+- `identity-control`: pin `v0.5.0`. Its first credential already records no value; it may move
+  to `CompleteWithheld`. Its maintenance job calls `PurgeCompleted` with a published window.
+- `foundation-reference`: pin `v0.5.0`; nothing else is required.
 
 ## Decisions this repository does not make
 
@@ -359,8 +379,8 @@ A pull request adding any of these is rejected on principle, not on review prefe
 
 ## Gates
 
-✅ **Design gate.** Both designs are approved, `TDD-001` at `2.4.0` and `TDD-002` at
-`1.4.0`, and the broker adapter interface, `outbox.Publisher`, is fixed in TDD-001 §Go
+✅ **Design gate.** Both designs are approved, `TDD-001` at `2.5.0` and `TDD-002` at
+`1.5.0`, and the broker adapter interface, `outbox.Publisher`, is fixed in TDD-001 §Go
 Surface.
 
 ✅ **Release gate.** The design gate, plus: ✅ partition lifecycle exercised end to end,
@@ -385,9 +405,12 @@ of the design never has to know this file exists.
 | `event_id` is not enforced unique in the outbox | TDD-001 §Data Model, already recorded in the design |
 | `inbox.Guard` takes `event.Type` because `processed_event.event_type` is mandatory | TDD-001 §Go Surface |
 | Idempotency is keyed by authenticated caller scope as required by TDD-002 middleware order | TDD-001 §Idempotency |
+| `platform.purge_idempotency_keys` takes an interval, `retain_for`, not the `retain_after` timestamp #102 sketched | TDD-001 §Idempotency |
+| `invitation-not-acceptable`, a resource-specific type, is in the registry of a module with no domain concept | TDD-002 §Problem Type Registry |
 
-The last one predates implementation. The rest were found by writing the code, which is
-the usual way a design's internal contradictions surface.
+The caller-scope row predates implementation, and the last two follow the decisions of
+2026-10-20. The rest were found by writing the code, which is the usual way a design's
+internal contradictions surface.
 
 ### `request-in-progress` added to the problem registry
 
@@ -418,3 +441,20 @@ any shape will not help; a 413 says it is well formed and too large, and splitti
 type is declared in status order, between `precondition-unmet` and `rate-limited`, so the numeric
 values of the constants after it moved. Nothing serializes those values: a document carries the
 URI, and consumers refer to the constants by name.
+
+### The idempotency purge takes an interval
+
+`scnehaux-architecture` #102 sketched `platform.purge_idempotency_keys(retain_after)`, a
+timestamp, like `drop_outbox_partitions`. The function takes `retain_for`, an interval, and
+computes the boundary from `now()`. `completed_at` is written by the database clock, and the
+24-hour floor has to be measured on that clock: a boundary computed by the caller would make the
+floor depend on the skew between two machines, and a window of exactly 24 hours would be refused
+by a caller whose clock ran ahead. The name and its purpose are unchanged.
+
+### A resource-specific problem type in a module with no domain concept
+
+`STD-GLB-001` 1.7.0 puts every problem type in this registry, once, and names
+`invitation-not-acceptable` as the first specific to one resource. The README's rule forbids a
+domain constant. The registry entry is a URI, a title and a status, and nothing here acts on it,
+so the rule's purpose, no back channel between two authorities, holds. The README records the
+exception, narrowly, beside the rule.

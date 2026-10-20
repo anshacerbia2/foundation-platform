@@ -3,12 +3,12 @@ doc_meta:
   id: TDD-foundation-platform-001
   title: Transactional Outbox, Dispatcher, and Enterprise Event Envelope
   owner: Core Platform Team
-  version: 2.4.1
+  version: 2.5.0
   status: approved
   classification: restricted
   review_cycle_days: 90
   created_date: 2026-08-10
-  last_reviewed: 2026-10-15
+  last_reviewed: 2026-10-20
   parent_sad:
     - SAD-001
     - SAD-004
@@ -588,6 +588,77 @@ A key is scoped to the authenticated caller. A repeated scoped key carrying a di
 replays the stored response without re-executing the operation. One caller cannot claim
 or replay another caller's key.
 
+**A secret answered once is never recorded (2.5.0).** `STD-GLB-001` 1.7.0: "A secret the
+command answers once is never in the idempotency record." A command whose answer carries a
+secret, such as an invitation token or a first credential, sends the secret live and records
+its answer without it. `CompleteWithheld` does that: it records the live body with the named
+members removed, and the caller sends the live body itself. A replay of the key answers the
+result, the invitation issued or the Principal created, without the secret. A lost secret is
+revoked and issued again. OWASP: "The best way to protect sensitive information is to not
+store it in the first place" [R10]. The IETF draft asks a replay to "respond with the result
+of the previously completed operation, success or an error" (§2.6 [R11]); the result is
+returned, and the secret is withheld.
+
+- **The stored body is derived from the live one.** `Withhold(body, pointers...)` removes the
+  members the pointers name and changes nothing else. A consumer that rendered the stored body
+  with a second renderer would let the two drift: a field added to one and not the other would
+  make a replay answer something the first response did not.
+- **The members are named by RFC 6901 JSON Pointers**, such as `/token` or
+  `/credential/value`. JSON Pointer "defines a string syntax for identifying a specific value
+  within a JavaScript Object Notation (JSON) document" [R12]. A pointer must name an object
+  member that is present. One that names nothing is refused, `ErrNotWithheld`, as RFC 6901 §4
+  treats it: evaluation "will raise an error condition if it fails to resolve a concrete value
+  for any of the JSON pointer's reference tokens" [R12]. Refusing is the point: a secret's
+  member renamed in the response and not at the call would otherwise be recorded under its new
+  name while every call succeeded.
+- **Encrypting the stored answer is rejected.** It adds a key to manage for a value nothing
+  needs to read again (`STD-GLB-001` 1.7.0).
+
+**Completed keys expire (2.5.0).** The draft: "The resource MAY require time based idempotency
+keys to be able to purge or delete a key upon its expiry. The resource SHOULD define such
+expiration policy and publish it in the documentation" (§2.3 [R11]). Each consuming service
+publishes its window and calls the purge from its maintenance stage.
+
+```sql
+CREATE INDEX idempotency_key_completed
+    ON platform.idempotency_key (completed_at) WHERE completed_at IS NOT NULL;
+
+platform.purge_idempotency_keys(retain_for INTERVAL) RETURNS BIGINT
+    -- deletes keys WHERE completed_at IS NOT NULL AND completed_at <= now() - retain_for
+    -- raises when retain_for is NULL or shorter than 24 hours
+```
+
+- **The window is an interval, and the database computes the boundary.** `completed_at` is
+  written by the database clock, so the boundary is computed by the same clock. A boundary
+  passed as a timestamp from the caller would make the floor depend on the skew between two
+  machines. `now()` is "Current date and time (start of current transaction)" [R13], so a long
+  maintenance transaction keeps slightly more, never less.
+- **The floor is 24 hours.** A key purged while a client still retries is a new request to the
+  next retry, which executes the command again. Stripe states the consequence of its own
+  pruning: "you can remove keys from the system automatically after they’re at least 24 hours
+  old. We generate a new request if a key is reused after the original is pruned" [R14]. A
+  service publishes a window at least this long and at least as long as any of its clients
+  retries. The function enforces the floor itself, so a consumer calling it without this
+  module's Go wrapper meets the same rule.
+- **An uncompleted key is never purged.** It is a claim whose effect may have committed without
+  its response (a process that died between the two). Removing it would let a retry execute the
+  command twice. `STD-GLB-001` 1.7.0 asks for completed keys to be purged, and only those.
+- **The index is partial.** Only completed keys are read by the purge. "A partial index is an
+  index built over a subset of a table; the subset is defined by a conditional expression"
+  [R15].
+- **The purge runs under the role of the consumer's maintenance stage**, which needs `SELECT`
+  and `DELETE` on `platform.idempotency_key`. The function is `SECURITY INVOKER`, the default,
+  so it grants nothing the caller does not hold.
+
+| Ref | Source |
+| :-- | :-- |
+| R10 | OWASP, *Cryptographic Storage Cheat Sheet*, §Minimise the Storage of Sensitive Information, <https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html>, accessed 2026-10-20 |
+| R11 | IETF HTTPAPI Working Group, J. Jena and S. Dalal, *The Idempotency-Key HTTP Header Field*, draft-ietf-httpapi-idempotency-key-header-07 (expired 18 April 2026; work in progress), §2.3, §2.6, <https://www.ietf.org/archive/id/draft-ietf-httpapi-idempotency-key-header-07.txt>, accessed 2026-10-20 |
+| R12 | IETF, *RFC 6901 JavaScript Object Notation (JSON) Pointer*, Abstract and §4, <https://www.rfc-editor.org/rfc/rfc6901>, accessed 2026-10-20 |
+| R13 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, §9.9 Date/Time Functions and Operators, <https://www.postgresql.org/docs/17/functions-datetime.html>, accessed 2026-10-20 |
+| R14 | Stripe, *Idempotent requests*, <https://docs.stripe.com/api/idempotent_requests>, accessed 2026-10-20 |
+| R15 | PostgreSQL Global Development Group, *PostgreSQL 17 Documentation*, §11.8 Partial Indexes, <https://www.postgresql.org/docs/17/indexes-partial.html>, accessed 2026-10-20 |
+
 ### Isolation Posture of the `platform` Schema
 
 Row-Level Security is **deliberately not applied** to any table in this schema, and the
@@ -732,6 +803,28 @@ package inbox
 // reports whether this delivery is the first. A false result means the effect
 // has already been applied and the delivery must be acknowledged and dropped.
 func Guard(ctx context.Context, tx db.Tx, consumer string, eventID id.UUID, eventType event.Type) (first bool, err error)
+```
+
+```go
+package idempotency
+
+// Claim reserves a key per caller scope in the caller's transaction; Complete records the
+// response a replay answers.
+func Claim(ctx context.Context, tx db.Tx, scope, key, digest string) (Result, error)
+func Complete(ctx context.Context, tx db.Tx, scope, key, digest string, status int, body json.RawMessage) error
+
+// The stored response beside the live one (2.5.0). Withhold removes the members the RFC 6901
+// pointers name; CompleteWithheld records body without them. ErrNotWithheld for a pointer that
+// names nothing, ErrInvalidPointer for one that names no object member, ErrNothingWithheld
+// for no pointer at all.
+func Withhold(body json.RawMessage, pointers ...string) (json.RawMessage, error)
+func CompleteWithheld(ctx context.Context, tx db.Tx, scope, key, digest string, status int,
+    body json.RawMessage, withheld ...string) error
+
+// Expiry (2.5.0). Deletes keys completed more than retention ago; ErrRetentionTooShort
+// below MinimumRetention, 24 hours.
+const MinimumRetention = 24 * time.Hour
+func PurgeCompleted(ctx context.Context, tx db.Tx, retention time.Duration) (int64, error)
 ```
 
 `eventType` was added during implementation because `platform.processed_event.event_type`
@@ -1093,6 +1186,21 @@ The host also supplies the maintenance boundaries. This design's values are:
   retains its incident fields.
 - An unresolved dead-letter row past the alert boundary is counted and is not disposed.
 
+### Idempotency
+
+- A replay of a key completed with `CompleteWithheld` answers the result without the withheld
+  member, and the stored `response_body` does not contain the secret, asserted against
+  PostgreSQL (`TestAReplayAnswersTheResultWithoutTheSecret`). This is `STD-GLB-001` 1.7.0's
+  test for a command that answers a secret, at the module's level; each consumer repeats it for
+  its own command.
+- A pointer that names nothing, an array element, or the whole document is refused before the
+  database is reached.
+- The purge deletes completed keys at or past the window and keeps a recent key and an
+  uncompleted key of any age. A purged key is claimed again as new
+  (`TestPurgeDeletesOnlyCompletedKeysPastTheWindow`).
+- The function itself refuses a window under 24 hours, for a caller that bypasses the Go
+  wrapper (`TestThePurgeFunctionRefusesAWindowUnder24Hours`).
+
 ### Envelope
 
 - Every published event validates against CloudEvents 1.0 with all seven required
@@ -1143,6 +1251,11 @@ it), and no runtime role needs `UPDATE` or `DELETE`. Each host grants accordingl
 `organization-control` does and asserts it. Retention deletes under the migration role, which owns
 the table, and never a receipt a closure cites.
 
+`platform.idempotency_key.response_body` holds what a replay answers, so it holds nothing a replay
+must not answer. A command that answers a secret records through `CompleteWithheld` (2.5.0). The
+record is also kept only for the window its service publishes: an answer kept for ever is personal
+data kept for ever, and EAD-003 §5.4 forbids keeping restricted data indefinitely.
+
 ## Performance Notes
 
 The publication path adds one insert to an existing transaction. Dispatch cost is one
@@ -1187,7 +1300,7 @@ investigation.
 | Governed by | ADR-GLB-016 — source-local outbox, delivery profiles, transport acceptance distinct from business completion |
 | Governed by | ADR-GLB-006 — Event Versioning and Schema Evolution |
 | Conforms to | STD-GLB-004 — CloudEvents envelope, deduplication, retry and dead-letter |
-| Conforms to | STD-GLB-001 — RFC 7807 problem details |
+| Conforms to | STD-GLB-001 1.7.0 — RFC 9457 problem details; a secret answered once is never in the idempotency record; completed keys expire |
 | Conforms to | STD-GLB-002 — sequence is a stream position, not an entity identifier |
 | Enterprise constraint | EAD-004 — commands, facts, and outcomes are distinct; mutations are duplicate-safe |
 | Enterprise constraint | EAD-003 — private domain persistence; no cross-domain database access |

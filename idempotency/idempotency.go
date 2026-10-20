@@ -1,5 +1,9 @@
 // Package idempotency claims mutation keys and replays completed responses without
 // re-executing their operations.
+//
+// A response that carries a secret answered once is recorded without it (CompleteWithheld), and
+// completed keys expire after the window each service publishes (PurgeCompleted). Both are
+// STD-GLB-001 1.7.0; TDD-foundation-platform-001 §Idempotency is the design.
 package idempotency
 
 import (
