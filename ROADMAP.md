@@ -398,6 +398,26 @@ both control repositories.
 
 Every clause is met. Both control repositories pin a tag; the Week 3 table records which.
 
+### Information security gates (ISMS-005, 2026-11-01)
+
+The approved risk treatment plan
+([ISMS-005](https://github.com/anshacerbia2/scnehaux-architecture/blob/main/07-isms/ISMS-005-risk-treatment-and-soa.md#treatment-plan))
+makes these gate items for this repository. Each risk (R) is rated in
+[ISMS-004](https://github.com/anshacerbia2/scnehaux-architecture/blob/main/07-isms/ISMS-004-risk-register.md#the-register);
+each action (T) has its owner role and target date there. When an action completes, this list and
+the SoA in ISMS-005 change together.
+
+- ⏳ **A failed scheduled run alerts the Information Security Officer** (T4, R21; by 30 November
+  2026). Today a failed run of `ci` alerts nobody; it shows only to someone who opens the Actions
+  tab.
+- ⏳ **Secret scanning in CI** (T5, R7; by 15 December 2026), as STD-IAM-001 §5 lists. Today nothing
+  scans a change for a secret before it reaches this public repository.
+- ⏳ **The shared workflows are called at a pinned commit** (T6, R14; by 31 December 2026). Today
+  `linter.yml` is called from scnehaux-architecture's `main` branch, so a change there changes what
+  this repository's CI runs.
+- ⏳ **A second person's approval on `main`** (T19, R19 and R23; before production). A ruleset
+  requires one approval once a second maintainer exists; until then each merge is a recorded risk.
+
 ## Departures from the designs, recorded
 
 Kept here as an index. Each is argued where it applies, in the design itself, so a reader
