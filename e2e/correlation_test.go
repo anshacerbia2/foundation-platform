@@ -106,12 +106,15 @@ func TestTheCorrelationIdentifierSurvivesFromRequestToConsumerSpan(t *testing.T)
 		}
 		ctx := observability.ContextWithMetadata(r.Context(), payload.Metadata)
 		ctx, span := consumerTelemetry.StartConsumer(ctx, applySpan, propagation.HeaderCarrier(r.Header))
-		defer span.End()
-
-		if err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
+		err := pool.InTx(ctx, func(ctx context.Context, tx db.Tx) error {
 			_, err := inbox.Guard(ctx, tx, consumer, delivered.ID, delivered.Type)
 			return err
-		}); err != nil {
+		})
+		// The span ends here, not in a defer: the test reads the ended spans as soon as it is
+		// told the event applied, and a deferred End ran after that signal, so the span was
+		// sometimes not yet recorded.
+		span.End()
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
